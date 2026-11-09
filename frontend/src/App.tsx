@@ -2,7 +2,7 @@ import { FormEvent, KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useS
 import { PASSWORD_INPUT_MAX_LENGTH, USERNAME_INPUT_MAX_LENGTH, validateAuthCredentials } from "./auth-validation";
 import { safeCitationSourceUrl } from "./source-url";
 import { QuestionStarters } from "./QuestionStarters";
-import { ScenicBackdrop, SceneryControls, useScenery, type SceneryState } from "./ScenicAtmosphere";
+import { buildWorkflowStages, mergePipelineEvent, responsePipelineEvents, type PipelineEvent } from "./workflow-progress";
 import {
   Activity,
   AlertTriangle,
@@ -16,7 +16,6 @@ import {
   HeartPulse,
   Info,
   LayoutDashboard,
-  Leaf,
   LockKeyhole,
   LogIn,
   LogOut,
@@ -25,12 +24,10 @@ import {
   PanelRight,
   Plus,
   ShieldCheck,
-  Sparkles,
   ThumbsDown,
   ThumbsUp,
   UserPlus,
   UserRound,
-  Wind,
   X,
 } from "lucide-react";
 
@@ -70,6 +67,9 @@ type SessionState = {
   network_enabled?: boolean;
   risk_assessed?: boolean;
   workflow_engine?: string;
+  workflow_version?: string;
+  workflow_path?: string[];
+  workflow_skipped_nodes?: string[];
   summary?: string;
 };
 
@@ -94,8 +94,6 @@ type Message = {
   requestId?: string;
 };
 
-type PipelineEvent = { node: string; label: string; elapsed_ms: number };
-
 type ChatResponseBody = {
   session_id: string;
   response_id?: string;
@@ -105,6 +103,7 @@ type ChatResponseBody = {
   structured_result?: StructuredResult | null;
   latency_ms?: number;
   summary?: string;
+  events?: PipelineEvent[];
 };
 
 function apiHeaders(init?: HeadersInit) {
@@ -241,7 +240,7 @@ function categoryLabel(category: string) {
 }
 
 function App() {
-  const scenery = useScenery();
+  const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const [authStatus, setAuthStatus] = useState<AuthStatus>("checking");
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authBootstrapError, setAuthBootstrapError] = useState<string | null>(null);
@@ -277,6 +276,13 @@ function App() {
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const closeTimerRef = useRef<number | null>(null);
   const authRequestRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const onChange = () => setReducedMotion(media.matches);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -387,9 +393,9 @@ function App() {
 
   useEffect(() => {
     if (messages.length > 1 || loading) {
-      bottomRef.current?.scrollIntoView({ behavior: scenery.reducedMotion ? "auto" : "smooth" });
+      bottomRef.current?.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth" });
     }
-  }, [messages, loading, scenery.reducedMotion]);
+  }, [messages, loading, reducedMotion]);
 
   function resetWorkspaceState() {
     activeSessionIdRef.current = null;
@@ -537,7 +543,7 @@ function App() {
     if (window.matchMedia("(max-width: 1020px)").matches) {
       openMobilePanel("right", trigger);
     } else {
-      document.getElementById("reference-section")?.scrollIntoView({ behavior: scenery.reducedMotion ? "auto" : "smooth", block: "nearest" });
+      document.getElementById("reference-section")?.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "nearest" });
     }
   }
 
@@ -628,7 +634,7 @@ function App() {
         signal: controller.signal,
       });
       await ensureResponseOk(response);
-      if (streaming && response.body) {
+      if (streaming && response.body && response.headers.get("content-type")?.includes("text/event-stream")) {
         const body = await consumeStream(response.body, generation, sessionId, controller);
         applyFinal(body, generation, sessionId, controller);
       } else {
@@ -695,7 +701,7 @@ function App() {
         const type = eventLine.replace("event:", "").trim();
         const payload = JSON.parse(dataLine.replace("data:", "").trim());
         if (type === "node") {
-          setEvents((current) => [...current, payload]);
+          setEvents((current) => mergePipelineEvent(current, payload as PipelineEvent));
         } else if (type === "final") {
           finalPayload = payload as ChatResponseBody;
         } else if (type === "error") {
@@ -757,6 +763,7 @@ function App() {
     setCitations(body.citations || []);
     setSelectedCitationMessageId(null);
     setStructuredResult(body.structured_result || null);
+    setEvents(responsePipelineEvents(body.events, body.state));
     addMessage({
       id: responseId,
       role: "assistant",
@@ -827,7 +834,6 @@ function App() {
   if (authStatus !== "authenticated" || !authUser) {
     return (
       <AuthScreen
-        scenery={scenery}
         status={authStatus}
         bootstrapError={authBootstrapError}
         onAuthenticated={enterWorkspace}
@@ -868,18 +874,16 @@ function App() {
     : citations;
 
   return (
-    <div className="app-shell" data-scene={scenery.scene} data-motion={scenery.paused || risk === "high" ? "paused" : "running"}>
-      <ScenicBackdrop scene={scenery.scene} paused={scenery.paused || risk === "high"} />
+    <div className="app-shell">
       <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark"><HeartPulse size={18} strokeWidth={2.4} /></div>
           <div>
             <div className="brand-name">MedGuide</div>
-            <div className="brand-subtitle">让健康，多一点清晰</div>
+            <div className="brand-subtitle">健康信息工作台</div>
           </div>
         </div>
         <div className="topbar-meta">
-          <SceneryControls scenery={scenery} attentionRequired={risk === "high"} />
           <span className={`service-status ${sessionStatus === "error" ? "unavailable" : !session ? "pending" : ""}`} role="status"><span className="status-dot" />{serviceStatusLabel}</span>
           <div className="account-cluster">
             <span className="account-identity"><UserRound size={15} /><span className="account-name">{authUser.username}</span></span>
@@ -911,7 +915,7 @@ function App() {
           tabIndex={mobilePanel === "left" ? -1 : undefined}
         >
           <div className="rail-heading">
-            <span className="eyebrow" id="session-panel-title">我的健康手记</span>
+            <span className="eyebrow" id="session-panel-title">会话工作区</span>
             <div className="rail-heading-actions">
               <button className="icon-button" onClick={newConversation} aria-label="新建整理"><Plus size={17} /></button>
               <button className="icon-button close-mobile" onClick={closeMobilePanel} aria-label="关闭会话列表"><X size={16} /></button>
@@ -922,16 +926,15 @@ function App() {
           <div className="conversation-list">
             <button className="conversation-item active" onClick={closeMobilePanel}>
               <span className="conversation-icon"><MessageCircle size={16} /></span>
-              <span className="conversation-copy"><strong>{messages.find((message) => message.role === "user")?.content || "从关心自己开始"}</strong><span>{messages.length > 1 ? `${messages.length - 1} 条消息` : "你的第一句，随时开始"}</span></span>
+              <span className="conversation-copy"><strong>{messages.find((message) => message.role === "user")?.content || "新的健康咨询"}</strong><span>{messages.length > 1 ? `${messages.length - 1} 条消息` : "尚未开始"}</span></span>
             </button>
           </div>
           <div className="rail-guide">
-            <span className="eyebrow">不必一次说清楚</span>
-            <ol><li>说说你在意的感受</li><li>一起补齐重要细节</li><li>带着线索，走好下一步</li></ol>
+            <span className="eyebrow">如何描述问题</span>
+            <ol><li>哪里不舒服，持续多久</li><li>有没有伴随症状或变化</li><li>你最希望了解什么</li></ol>
           </div>
-          <div className="rail-scenery"><SceneryControls scenery={scenery} attentionRequired={risk === "high"} /></div>
           <div className="rail-footer">
-            {risk === "high" ? <div className="urgent-note"><AlertTriangle size={21} /><strong>请优先处理紧急情况</strong><p>如有持续胸痛、呼吸困难等紧急症状，请立即联系当地急救，不要等待在线回复。</p></div> : <div className="rail-landscape"><Wind size={22} className="ambient-motion" /><span>A MOMENT FOR YOU</span><p>留一点时间，<br />听听身体的声音。</p></div>}
+            {risk === "high" ? <div className="urgent-note"><AlertTriangle size={21} /><strong>请优先处理紧急情况</strong><p>请按回答中的紧急就医指引行动，不要等待在线回复。</p></div> : <div className="scope-note"><BookOpen size={18} /><strong>信息整理 · 就医准备</strong><p>回答会注明可用资料。资料不足时，请以医生或药师的判断为准。</p></div>}
             <div className="privacy-line"><ShieldCheck size={16} /><span>关心健康，也保护隐私。<br />请勿输入姓名、证件号等身份信息。</span></div>
           </div>
         </aside>
@@ -939,8 +942,8 @@ function App() {
         <main className={`chat-workspace ${isWelcome ? "is-welcome" : ""}`}>
           <div className="chat-header">
             <div>
-              <div className="eyebrow">YOUR HEALTH, A LITTLE CLEARER</div>
-              <h1>{risk === "high" ? "请优先寻求紧急医疗帮助" : isWelcome ? "和 MedGuide 聊聊" : "把身体的事，一点点理清"}</h1>
+              <div className="eyebrow">MedGuide / 健康咨询</div>
+              <h1>{risk === "high" ? "请优先寻求紧急医疗帮助" : isWelcome ? "新的健康咨询" : "当前咨询"}</h1>
             </div>
             <div className="chat-header-actions">
               <span className={`risk-chip ${risk}`}><span className="risk-chip-dot" />{riskLabel}</span>
@@ -966,17 +969,17 @@ function App() {
 
           <div className="messages-scroller">
             {isWelcome ? <section className="welcome-view" aria-labelledby="welcome-heading">
-              <div className="welcome-kicker"><span className="welcome-leaf ambient-motion"><Leaf size={22} /></span><span>给自己，多一点关照</span></div>
-              <h2 id="welcome-heading">身体的小问号，<br /><span>从这里慢慢解开。</span></h2>
-              <p className="welcome-description">不必想好专业的说法。<br className="mobile-break" />从一处不舒服、一项检查，或一次就诊前的准备开始。</p>
+              <div className="welcome-kicker"><span className="welcome-leaf"><HeartPulse size={20} /></span><span>健康信息工作台</span></div>
+              <h2 id="welcome-heading">先说说你的情况。</h2>
+              <p className="welcome-description">可以从哪里不舒服、持续多久开始。用药或检查方面的疑问，也可以直接提问。</p>
               <QuestionStarters disabled={loading} onChoose={chooseStarter} />
-              <div className="welcome-note"><NotebookPen size={15} /><span>点选一个问题，按你的情况修改后再发送。</span></div>
+              <div className="welcome-note"><NotebookPen size={15} /><span>先从一个具体问题开始，信息会随着对话逐步补齐。</span></div>
             </section> : <div className="message-date"><span />{formatDateDivider(messages[0]?.timestamp ?? Date.now())}<span /></div>}
             {(!isWelcome ? messages : []).map((message) => (
               <article className={`message-row ${message.role}`} key={message.id}>
-                {message.role === "assistant" && <div className="message-avatar assistant-avatar"><Sparkles size={16} /></div>}
+                {message.role === "assistant" && <div className="message-avatar assistant-avatar"><Activity size={16} /></div>}
                 <div className="message-content">
-                  <div className="message-meta"><strong>{message.role === "assistant" ? "MedGuide" : "你"}</strong><span>{message.role === "assistant" ? "健康信息助手" : authUser.username}</span><time dateTime={new Date(message.timestamp).toISOString()}>{formatTime(new Date(message.timestamp))}</time></div>
+                  <div className="message-meta"><strong>{message.role === "assistant" ? "MedGuide" : "你"}</strong><span>{message.role === "assistant" ? "健康信息整理" : authUser.username}</span><time dateTime={new Date(message.timestamp).toISOString()}>{formatTime(new Date(message.timestamp))}</time></div>
                   <div className="message-bubble">{message.content.split("\n").map((line, index) => <p key={`${message.id}-${index}`}>{line || "\u00a0"}</p>)}</div>
                   {message.role === "assistant" && message.citations && message.citations.length > 0 && (
                     <button type="button" className="inline-citations" onClick={(event) => showReferences(event.currentTarget, message.id)}><BookOpen size={14} /><span>查看 {message.citations.length} 条参考资料</span><ArrowUpRight size={13} /></button>
@@ -988,7 +991,7 @@ function App() {
             ))}
             {loading && (
               <article className="message-row assistant loading-row">
-                <div className="message-avatar assistant-avatar"><Sparkles size={16} /></div>
+                <div className="message-avatar assistant-avatar"><Activity size={16} /></div>
                 <div className="message-content"><div className="message-meta"><strong>MedGuide</strong><span>正在核对你提供的信息</span></div><div className="loading-bubble" role="status" aria-label="正在整理回答"><span /><span /><span /></div></div>
               </article>
             )}
@@ -1014,18 +1017,17 @@ function App() {
           tabIndex={mobilePanel === "right" ? -1 : undefined}
         >
           <div className="panel-topline"><span className="eyebrow" id="context-panel-title">你的健康线索</span><button className="icon-button close-mobile" onClick={closeMobilePanel} aria-label="关闭面板"><X size={16} /></button></div>
-          {isWelcome && <div className="context-intro"><span>每一点细节，都有意义</span><h2>让下一步，<br />更有方向。</h2></div>}
           <section className={`risk-panel ${risk}`}>
             <div className="risk-heading"><div className="risk-icon">{risk === "high" ? <AlertTriangle size={17} /> : risk === "unknown" ? <Info size={17} /> : <ShieldCheck size={17} />}</div><div><span className="section-kicker">安全筛查</span><h2>{riskHeading}</h2></div></div>
             {session?.risk_flags?.length
               ? <div className="risk-flags">{session.risk_flags.map((flag) => <span key={flag}>{flag}</span>)}</div>
               : <p>{riskAssessed ? "已完成规则筛查，继续补充信息后会动态更新。" : "先了解你的情况，再检查需要留意的信号。当前风险尚未评估。"}</p>}
-            <div className="risk-meter"><span className="meter-label">风险等级</span><div className="meter-track"><span className="meter-fill" /></div><strong>{risk === "high" ? "HIGH" : risk === "watch" ? "WATCH" : risk === "low" ? "LOW" : "UNKNOWN"}</strong></div>
+            <div className="risk-status"><span className="status-dot" />{riskAssessed ? "随补充信息重新筛查" : "等待首次描述"}</div>
           </section>
 
           {isWelcome ? <section className="panel-section preparation-section"><div className="section-heading"><h2>聊之前，可以想一想</h2><NotebookPen size={17} /></div><ol className="preparation-list"><li><span>01</span><div><strong>最在意的感受</strong><p>哪里不舒服？与平时有什么不同？</p></div></li><li><span>02</span><div><strong>发生的时间</strong><p>什么时候开始，有没有变得更明显？</p></div></li><li><span>03</span><div><strong>你想弄清的事</strong><p>用药、检查，还是该去哪个科室？</p></div></li></ol></section> : <section className="panel-section profile-section"><div className="section-heading"><div><span className="section-kicker">已提供的信息</span><h2>已经了解的情况</h2></div><Activity size={16} /></div><div className="profile-grid"><ProfileField label="主要症状" value={profile.chief_complaint as string} /><ProfileField label="持续时间" value={profile.duration as string} /><ProfileField label="伴随症状" value={Array.isArray(profile.associated_symptoms) ? profile.associated_symptoms.join("、") : undefined} /><ProfileField label="既往史" value={profile.history as string} /></div>{session?.summary && <div className="summary-box"><span>整理摘要</span><p>{session.summary}</p></div>}{session?.next_question && <p className="next-question"><span>还可以补充</span>{session.next_question}</p>}</section>}
 
-          {!isWelcome && <section className="panel-section pipeline-section"><div className="section-heading"><div><span className="section-kicker">本次整理</span><h2>处理进度</h2></div></div><div className="pipeline-list">{[{ label: "整理你提供的信息", end: 3 }, { label: "检查需要及时就医的信号", end: 4 }, { label: risk === "high" ? "提供紧急就医指引" : "核对资料并生成建议", end: 7 }, { label: risk === "high" ? "检查就医指引" : "检查回答与引用", end: 9 }].map(({ label, end }, index) => { const complete = events.length >= end; return <div className={`pipeline-item ${complete ? "complete" : ""}`} key={label}><span className="pipeline-index">{complete ? <Check size={11} /> : index + 1}</span><span>{label}</span></div>; })}</div></section>}
+          {!isWelcome && <section className="panel-section pipeline-section"><div className="section-heading"><div><span className="section-kicker">本次整理{session?.workflow_version ? ` · ${session.workflow_version}` : ""}</span><h2>处理进度</h2></div></div>{events.length || loading ? <div className="pipeline-list" aria-label="本轮处理进度">{buildWorkflowStages(events, risk, session?.intent, loading).map((stage, index) => <div className={`pipeline-item ${stage.status}`} key={stage.id} data-status={stage.status}><span className="pipeline-index">{stage.status === "completed" ? <Check size={12} /> : index + 1}</span><div><span>{stage.label}</span>{stage.detail && <small>{stage.detail}</small>}</div><span className="pipeline-state">{stage.status === "completed" ? "完成" : stage.status === "skipped" ? "跳过" : stage.status === "running" ? "进行中" : "待处理"}</span></div>)}</div> : <p className="pipeline-unavailable">回答已完成，未返回详细流程。</p>}</section>}
 
           <section className="panel-section evidence-section" id="reference-section">
             <div className="section-heading"><div><span className="section-kicker">{selectedCitationMessageId ? "所选回答的资料" : "有依据，才更清晰"}</span><h2>参考资料 <span>{referenceCitations.length}</span></h2></div><BookOpen size={16} /></div>
@@ -1052,14 +1054,13 @@ function App() {
 }
 
 type AuthScreenProps = {
-  scenery: SceneryState;
   status: AuthStatus;
   bootstrapError: string | null;
   onAuthenticated: (user: AuthUser) => void;
   onRetryConnection: () => void;
 };
 
-function AuthScreen({ scenery, status, bootstrapError, onAuthenticated, onRetryConnection }: AuthScreenProps) {
+function AuthScreen({ status, bootstrapError, onAuthenticated, onRetryConnection }: AuthScreenProps) {
   const [mode, setMode] = useState<AuthMode>("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -1125,21 +1126,20 @@ function AuthScreen({ scenery, status, bootstrapError, onAuthenticated, onRetryC
   const serviceUnavailable = Boolean(!formError && (bootstrapError?.includes("连接账户服务") || bootstrapError?.includes("服务暂时不可用")));
 
   return (
-    <main className="auth-shell" data-scene={scenery.scene} data-motion={scenery.paused ? "paused" : "running"}>
-      <ScenicBackdrop scene={scenery.scene} paused={scenery.paused} />
+    <main className="auth-shell">
       <header className="auth-topbar">
         <div className="auth-brand-lockup">
           <div className="auth-brand-mark"><HeartPulse size={24} strokeWidth={2.3} /></div>
-          <div><span>MedGuide<span className="brand-period">.</span></span><small>让健康，多一点清晰</small></div>
+          <div><span>MedGuide<span className="brand-period">.</span></span><small>健康信息工作台</small></div>
         </div>
-        <SceneryControls scenery={scenery} />
+        <span className="auth-topbar-label">健康信息整理与就医指引</span>
       </header>
       <div className="auth-layout">
       <section className="auth-context" aria-labelledby="auth-product-name">
         <div className="auth-product-copy">
-          <div className="auth-greeting"><span className="greeting-line" />给自己，多一点关照</div>
-          <h1 id="auth-product-name">身体的小问号，<br /><span>一起慢慢解开。</span></h1>
-          <p>关于身体的疑问，不必一个人反复搜索。<br />从一处不舒服，到一次就诊前的准备，<br className="desktop-break" />陪你把零散的信息，理成清晰的下一步。</p>
+          <div className="auth-greeting"><span className="greeting-line" />健康信息工作台</div>
+          <h1 id="auth-product-name">就医之前，<br /><span>先把情况说清楚。</span></h1>
+          <p>把症状、检查和用药疑问整理成清晰线索。<br />先核对风险，再查看资料和下一步建议。</p>
         </div>
         <QuestionStarters compact />
         <div className="auth-value-line"><span><MessageCircle size={15} />把症状说清楚</span><span><BookOpen size={15} />让信息有依据</span><span><ArrowUpRight size={15} />为就医做准备</span></div>
@@ -1154,10 +1154,10 @@ function AuthScreen({ scenery, status, bootstrapError, onAuthenticated, onRetryC
         ) : (
           <>
             <div className="auth-panel-heading">
-              <div className="auth-panel-emblem ambient-motion"><Leaf size={23} strokeWidth={1.6} /></div>
-              <span className="section-kicker">A LITTLE CARE, EVERY DAY</span>
-              <h2 id="auth-heading">{mode === "login" ? "很高兴，在这里遇见你" : "从今天，开始关照自己"}</h2>
-              <p>{mode === "login" ? "登录 MedGuide，给身体的疑问找点头绪。" : "用一个昵称，开启你的健康对话。"}</p>
+              <div className="auth-panel-emblem"><ShieldCheck size={22} strokeWidth={1.8} /></div>
+              <span className="section-kicker">账户登录 / MEDGUIDE</span>
+              <h2 id="auth-heading">{mode === "login" ? "进入你的健康工作台" : "创建一个健康工作台"}</h2>
+              <p>{mode === "login" ? "登录后继续整理健康信息与就医线索。" : "使用一个昵称，开启你的健康对话。"}</p>
             </div>
 
             <div className="auth-mode-switch" aria-label="选择账户操作">
@@ -1233,7 +1233,7 @@ function AuthScreen({ scenery, status, bootstrapError, onAuthenticated, onRetryC
 
               <button className="auth-submit" type="submit" disabled={pending || !username || !password || (mode === "register" && !passwordConfirmation)}>
                 {pending && <span className="button-spinner" aria-hidden="true" />}
-                {pending ? (mode === "login" ? "正在登录" : "正在创建") : mode === "login" ? "登录，开始聊聊" : "创建账户，开始聊聊"}
+                {pending ? (mode === "login" ? "正在登录" : "正在创建") : mode === "login" ? "登录工作台" : "创建账户"}
                 {!pending && <ArrowRight size={18} />}
               </button>
             </form>
@@ -1243,7 +1243,7 @@ function AuthScreen({ scenery, status, bootstrapError, onAuthenticated, onRetryC
       </section>
       </div>
       <footer className="auth-footer">
-        <div className="scenic-caption"><Wind size={18} className="ambient-motion" /><span>{scenery.scene === "lake" ? "一湖山色，一点从容" : "走进林间，留一点空白"}</span><span className="caption-rule" /><small>A MOMENT FOR YOURSELF</small></div>
+        <span>MedGuide · 健康信息工作台</span>
         <p>健康信息整理与就医指引<br />不替代医生诊断、处方或急救服务</p>
       </footer>
     </main>

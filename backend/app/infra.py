@@ -738,7 +738,13 @@ return 1
         if callable(pipeline_factory):
             try:
                 from redis.exceptions import WatchError
+            except ImportError:
+                # Redis is optional in offline mode; keep the exception
+                # contract available for lightweight pipeline test doubles.
+                class WatchError(Exception):
+                    pass
 
+            try:
                 pipe = pipeline_factory()
                 pipe.watch(key)
                 current_raw = pipe.get(key)

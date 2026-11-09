@@ -13,17 +13,11 @@ Nginx 同源 UI（静态前端、CSP、限流、/api 反向代理）
 FastAPI API（认证、归属、幂等、协议门禁）
     │
     ▼
-LangGraph 状态图
+LangGraph 条件状态图
 normalize → extract_profile → intent → risk
-    ├──────────────────────────────┐
-    ▼                              ▼
-混合 RAG                         NL2SQL Guard
-Query Rewrite                    只读 / 表字段白名单 / LIMIT
-意图路由                         MySQL（配置后启用）
-BM25 + Milvus 召回
-融合排序、实体一致性、去重压缩
-    │                              │
-    └──────────────┬───────────────┘
+    ├─ 普通咨询 → 混合 RAG（Query Rewrite、意图路由、BM25 + Milvus）
+    ├─ 结构化问题 → NL2SQL Guard（只读、表字段白名单、LIMIT）
+    └─ 高风险 → 跳过普通查询，直接就医分流
                    ▼
 draft → safety_review → finalize
                    │
@@ -35,7 +29,7 @@ OpenAI 兼容服务：安全探针与有引用生成
 
 ## 状态与安全
 
-`WorkflowState` 是节点之间唯一的数据契约，包含会话画像、意图、风险、引用、结构化结果、答案来源、请求结果和耗时。风险节点先于检索和生成；`high` 会短路普通 RAG 与结构化查询，答案只保留就医指引。生产请求必须经过用户名归属校验，并以 `request_id + fingerprint` 防止断线重试重复推进。
+`WorkflowState` 是节点之间唯一的数据契约，包含会话画像、意图、风险、引用、结构化结果、答案来源、请求结果和耗时。风险节点先于检索和生成；`high` 会短路普通查询，答案只保留就医指引。结构化高风险问题仍会经过只读查询门禁并返回阻断结果。生产请求必须经过用户名归属校验，并以 `request_id + fingerprint` 防止断线重试重复推进。
 
 外部模型只接收经过白名单压缩的临床摘要和脱敏引用上下文；原始输入不进入 Embedding 或生成请求。认证数据库只保存密码哈希、盐和会话 Token 哈希。
 

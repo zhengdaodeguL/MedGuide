@@ -27,6 +27,21 @@ NODE_LABELS = {
     "finalize": "整理引用与摘要",
 }
 
+# Keep the public progress contract stable while allowing the graph to route
+# around work that is irrelevant or unsafe for the current turn.
+WORKFLOW_VERSION = "2026.11"
+WORKFLOW_ORDER = (
+    "normalize",
+    "extract_profile",
+    "intent",
+    "risk",
+    "retrieve",
+    "structured_query",
+    "draft",
+    "safety_review",
+    "finalize",
+)
+
 
 class WorkflowCancelled(RuntimeError):
     """Internal signal used to stop a streamed run after client disconnect."""
@@ -180,7 +195,7 @@ class MedGuideWorkflow:
             return False
 
     def _build_graph(self):
-        """Compile the same node contract for deployments that install LangGraph."""
+        """Compile the conditional graph for deployments that install LangGraph."""
         try:
             from langgraph.graph import END, START, StateGraph
 
@@ -199,9 +214,22 @@ class MedGuideWorkflow:
             for name, method in node_methods.items():
                 graph.add_node(name, method)
             graph.add_edge(START, "normalize")
-            ordered = tuple(node_methods)
-            for current, following in zip(ordered, ordered[1:]):
-                graph.add_edge(current, following)
+            graph.add_edge("normalize", "extract_profile")
+            graph.add_edge("extract_profile", "intent")
+            graph.add_edge("intent", "risk")
+            graph.add_conditional_edges(
+                "risk",
+                self._route_after_risk,
+                {
+                    "retrieve": "retrieve",
+                    "structured_query": "structured_query",
+                    "draft": "draft",
+                },
+            )
+            graph.add_edge("retrieve", "draft")
+            graph.add_edge("structured_query", "draft")
+            graph.add_edge("draft", "safety_review")
+            graph.add_edge("safety_review", "finalize")
             graph.add_edge("finalize", END)
             return graph.compile()
         except Exception:
@@ -217,12 +245,66 @@ class MedGuideWorkflow:
         started = time.perf_counter()
         state = dict(state)
         state["events"] = []
-        if self.graph is not None and on_event is None:
+        state["workflow_version"] = WORKFLOW_VERSION
+        # Query outputs belong to one turn. Clear them before either runner
+        # chooses a branch so skipped nodes cannot leak a previous answer.
+        state["citations"] = []
+        state["structured_result"] = None
+        state["rewritten_query"] = ""
+        if self.graph is not None and on_event is None and cancel_event is None:
             try:
-                compiled_result = dict(self.graph.invoke(state))
+                # ``stream(..., updates)`` is the current LangGraph execution
+                # contract and gives us the actual conditional path. Each
+                # node still returns a complete serializable state update.
+                compiled_result = dict(state)
+                completed: dict[str, dict[str, Any]] = {}
+                path: list[str] = []
+                if hasattr(self.graph, "stream"):
+                    for update in self.graph.stream(state, stream_mode="updates"):
+                        for node, node_update in update.items():
+                            if node not in NODE_LABELS:
+                                continue
+                            if isinstance(node_update, dict):
+                                compiled_result.update(node_update)
+                            path.append(node)
+                            completed[node] = {
+                                "type": "node",
+                                "node": node,
+                                "label": NODE_LABELS[node],
+                                "status": "completed",
+                                "elapsed_ms": 0.0,
+                            }
+                else:
+                    # A small compatibility path keeps test doubles and older
+                    # compiled graphs usable while production uses stream().
+                    compiled_result.update(dict(self.graph.invoke(state)))
+                    path = list(WORKFLOW_ORDER)
+                    completed = {
+                        node: {
+                            "type": "node",
+                            "node": node,
+                            "label": NODE_LABELS[node],
+                            "status": "completed",
+                            "elapsed_ms": 0.0,
+                        }
+                        for node in WORKFLOW_ORDER
+                    }
+                skipped = [node for node in WORKFLOW_ORDER if node not in completed]
+                compiled_result["workflow_path"] = path
+                compiled_result["workflow_skipped_nodes"] = skipped
                 compiled_result["events"] = [
-                    {"type": "node", "node": name, "label": NODE_LABELS[name], "status": "completed", "elapsed_ms": 0.0}
-                    for name in NODE_LABELS
+                    completed.get(
+                        node,
+                        {
+                            "type": "node",
+                            "node": node,
+                            "label": NODE_LABELS[node],
+                            "status": "skipped",
+                            "reason": "conditional-route",
+                            "elapsed_ms": 0.0,
+                        },
+                    )
+                    for node in WORKFLOW_ORDER
                 ]
                 compiled_result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
                 compiled_result["workflow_engine"] = "langgraph"
@@ -232,23 +314,31 @@ class MedGuideWorkflow:
                 # model calls. Replaying from normalize would duplicate those
                 # side effects, so compatibility fallback is compile-time only.
                 raise WorkflowExecutionError("整理工作流执行失败，请稍后重试") from exc
-        nodes = (
-            self.normalize,
-            self.extract_profile,
-            self.intent,
-            self.risk,
-            self.retrieve,
-            self.structured_query,
-            self.draft,
-            self.safety_review,
-            self.finalize,
-        )
-        for node in nodes:
+        nodes = {name: getattr(self, name) for name in WORKFLOW_ORDER}
+        executed: list[str] = []
+        skipped: list[str] = []
+        for name in WORKFLOW_ORDER:
             if cancel_event is not None and cancel_event.is_set():
                 raise WorkflowCancelled()
-            name = node.__name__
+            should_run = name not in {"retrieve", "structured_query"} or name == self._route_after_risk(state)
+            if not should_run:
+                skipped.append(name)
+                event = {
+                    "type": "node",
+                    "node": name,
+                    "label": NODE_LABELS[name],
+                    "status": "skipped",
+                    "reason": "conditional-route",
+                    "elapsed_ms": 0.0,
+                }
+                state.setdefault("events", []).append(event)
+                if on_event:
+                    on_event(event)
+                continue
+            node = nodes[name]
             node_started = time.perf_counter()
             state = node(state)
+            executed.append(name)
             event = {
                 "type": "node",
                 "node": name,
@@ -262,12 +352,23 @@ class MedGuideWorkflow:
         if cancel_event is not None and cancel_event.is_set():
             raise WorkflowCancelled()
         state["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        state["workflow_path"] = executed
+        state["workflow_skipped_nodes"] = skipped
         # ``langgraph_available`` describes an installed capability, not the
-        # runner used for this invocation.  SSE/cancellation uses the
-        # deterministic loop so its event and cancellation semantics are
-        # explicit.
+        # runner used for this invocation. SSE and any cancellation-aware
+        # invocation use the deterministic loop so their event and
+        # cancellation semantics are explicit.
         state["workflow_engine"] = "deterministic"
         return state
+
+    @staticmethod
+    def _route_after_risk(state: WorkflowState) -> str:
+        """Select the single work branch after risk screening."""
+        if state.get("risk_level") == "high":
+            return "structured_query" if state.get("intent") == "structured" else "draft"
+        if state.get("intent") == "structured":
+            return "structured_query"
+        return "retrieve"
 
     def normalize(self, state: WorkflowState) -> WorkflowState:
         message = state.get("user_message", "").strip()

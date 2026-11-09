@@ -20,9 +20,17 @@ docs/              设计、架构、运行和质量说明
 
 ## 工作流约束
 
-节点顺序固定为：`normalize → extract_profile → intent → risk → retrieve → structured_query → draft → safety_review → finalize`。
+工作流使用版本化的条件状态图（当前版本 `2026.11`）。固定节点契约为：`normalize → extract_profile → intent → risk → (retrieve | structured_query | bypass) → draft → safety_review → finalize`。其中 `bypass` 表示直接进入 `draft` 的路由，不是额外节点，`draft` 每轮只执行一次。`risk` 根据风险等级和意图选择唯一分支，避免在高风险或结构化问题上执行无关检索；每轮仍产生九个节点事件，跳过分支标记为 `skipped`。
 
 节点接收并返回可序列化状态，副作用必须可观测且可测试。风险为 `high` 时，生成节点只能输出就医指引与急救提示，不得输出诊断、处方或停药建议。
+
+### 编排依赖基线
+
+2026 年 11 月 9 日核对 PyPI 的稳定版本后，编排依赖更新为 `langgraph>=1.2.20,<2.0`、`langchain-core>=1.7.6,<2.0`。当前验证组合为 LangGraph `1.2.20` 与 LangChain Core `1.7.6`；其他服务 SDK 不随本次编排迁移跨大版本升级。
+
+LangGraph v1 要求 Python 3.10 及以上，仓库的 CI（3.11）与容器（3.13）均满足。项目使用自定义 `StateGraph`、条件边与 `stream_mode="updates"`，不使用本次迁移已弃用的预构建 `create_react_agent`、`MessageGraph` 或旧 `AgentState`。安装后执行 `python -m pip check` 和完整 `pytest`；两种 runner 必须覆盖相同的路由、取消与请求回放契约。
+
+参考：[LangGraph v1 迁移指南](https://docs.langchain.com/oss/python/migrate/langgraph-v1)、[LangGraph PyPI](https://pypi.org/project/langgraph/)、[LangChain Core PyPI](https://pypi.org/project/langchain-core/)。
 
 ## API 契约
 

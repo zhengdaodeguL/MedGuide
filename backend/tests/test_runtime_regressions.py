@@ -237,6 +237,10 @@ def test_old_request_replay_keeps_original_answer_and_current_medical_state(monk
                 "events": [],
                 "confidence": 0.8,
                 "latency_ms": 1,
+                "workflow_engine": "langgraph" if turn == 1 else "deterministic",
+                "workflow_version": f"test-version-{turn}",
+                "workflow_path": ["retrieve"] if turn == 1 else ["structured_query"],
+                "workflow_skipped_nodes": ["structured_query"] if turn == 1 else ["retrieve"],
             }
 
     store = SessionStore(mode="test")
@@ -269,6 +273,10 @@ def test_old_request_replay_keeps_original_answer_and_current_medical_state(monk
         assert result["response"] == "answer-1"
         assert result["response_id"] == "response-1"
         assert result["citations"] == [{"id": "citation-1"}]
+        assert result["workflow_engine"] == "langgraph"
+        assert result["workflow_version"] == "test-version-1"
+        assert result["workflow_path"] == ["retrieve"]
+        assert result["workflow_skipped_nodes"] == ["structured_query"]
         assert result["turn_count"] == 2
         assert result["profile"] == {"symptoms": [], "associated_symptoms": [], "age": 32, "duration": "3天"}
         assert result["summary"] == "current-summary-2"
@@ -288,6 +296,10 @@ def test_old_request_replay_keeps_original_answer_and_current_medical_state(monk
     assert payload["state"]["turn_count"] == 2
     assert payload["state"]["profile"]["age"] == 32
     assert payload["state"]["summary"] == "current-summary-2"
+    assert payload["state"]["workflow_engine"] == "langgraph"
+    assert payload["state"]["workflow_version"] == "test-version-1"
+    assert payload["state"]["workflow_path"] == ["retrieve"]
+    assert payload["state"]["workflow_skipped_nodes"] == ["structured_query"]
     assert workflow.calls == 2
 
 

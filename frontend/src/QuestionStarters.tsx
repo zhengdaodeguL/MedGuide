@@ -108,7 +108,7 @@ export function QuestionStarters({ compact = false, disabled = false, onChoose }
         })}
       </div>
 
-      <div className="starter-prompts" aria-label={`${selected.label}的提问示例`}>
+      <div className="starter-prompts" key={selected.id} aria-label={`${selected.label}的提问示例`}>
         {compact ? (
           <div className="starter-prompt">
             <span className="starter-prompt-icon"><SelectedIcon size={19} aria-hidden="true" /></span>

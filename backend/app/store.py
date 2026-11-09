@@ -19,6 +19,10 @@ _REQUEST_RESPONSE_FIELDS = (
     "events",
     "confidence",
     "latency_ms",
+    "workflow_engine",
+    "workflow_version",
+    "workflow_path",
+    "workflow_skipped_nodes",
 )
 
 
@@ -368,6 +372,9 @@ class SessionStore:
             "summary": state.get("summary", ""),
             "mode": state.get("mode", "production"),
             "workflow_engine": state.get("workflow_engine", "deterministic"),
+            "workflow_version": state.get("workflow_version", "2026.11"),
+            "workflow_path": state.get("workflow_path", []),
+            "workflow_skipped_nodes": state.get("workflow_skipped_nodes", []),
             "environment": self.mode if self.mode in {"offline", "test"} else "production",
             "network_enabled": self.mode not in {"offline", "test"},
             "updated_at": state.get("updated_at"),

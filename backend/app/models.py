@@ -43,6 +43,9 @@ class WorkflowState(TypedDict, total=False):
     latency_ms: float
     mode: str
     workflow_engine: str
+    workflow_version: str
+    workflow_path: list[str]
+    workflow_skipped_nodes: list[str]
     updated_at: str
     answer_source: str
     response_id: str
