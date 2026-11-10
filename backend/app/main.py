@@ -547,7 +547,10 @@ def _require_access(
     else:
         username = _username_from_cookie(current, session_token)
         principal = f"user:{username}" if username else None
-    if principal is None and getattr(current, "production", False):
+    # A proxy-validated cookie can expire or be revoked before this handler.
+    # Cookie-bearing offline requests must not fall back to anonymous access;
+    # production service-header priority remains unchanged.
+    if principal is None and (getattr(current, "production", False) or session_token is not None):
         raise HTTPException(status_code=401, detail="请先登录")
     _require_runtime(current)
     return principal

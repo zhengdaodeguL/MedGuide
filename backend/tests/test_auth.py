@@ -18,7 +18,7 @@ from app.main import app
 from app.store import SessionStore
 
 
-def _runtime(tmp_path, *, clock=None, cookie_secure=True):
+def _runtime(tmp_path, *, clock=None, cookie_secure=True, production=True):
     kwargs = {"clock": clock} if clock is not None else {}
     auth = AuthStore(
         tmp_path / "runtime" / "auth.sqlite3",
@@ -28,12 +28,12 @@ def _runtime(tmp_path, *, clock=None, cookie_secure=True):
         **kwargs,
     )
     return SimpleNamespace(
-        production=True,
-        mode="production",
+        production=production,
+        mode="production" if production else "offline",
         api_tokens=("service-client-token",),
         production_missing=(),
         auth=auth,
-        store=SessionStore(mode="production"),
+        store=SessionStore(mode="production" if production else "offline"),
     )
 
 
@@ -416,6 +416,94 @@ def test_business_sessions_are_owned_by_authenticated_username(tmp_path, monkeyp
         alice.close()
         bob.close()
         anonymous.close()
+
+
+@pytest.mark.parametrize("cookie_state", ["invalid", "expired", "revoked", "empty"])
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Authorization": "Bearer service-client-token"}, {"X-API-Key": "service-client-token"}],
+)
+def test_offline_failed_cookie_never_downgrades_to_anonymous_access(
+    tmp_path, monkeypatch, cookie_state: str, headers: dict[str, str]
+) -> None:
+    now = [1_000.0]
+    current = _runtime(tmp_path, clock=lambda: now[0], cookie_secure=False, production=False)
+    monkeypatch.setattr(main_module, "get_services", lambda: current)
+    victim = current.store.create(owner_id="user:another_user")
+    username = current.auth.register("offline_user", "Correct-Horse-42")
+    token, _expires_at = current.auth.create_session(username)
+    client = _client()
+    try:
+        client.cookies.set(current.auth.cookie_name, token)
+        # Model a successful proxy auth subrequest before the business handler.
+        assert client.get("/api/auth/me").status_code == 200
+        if cookie_state == "expired":
+            now[0] = 1_300.0
+        elif cookie_state == "revoked":
+            current.auth.revoke_session(token)
+        else:
+            client.cookies.set(current.auth.cookie_name, "invalid-token" if cookie_state == "invalid" else "")
+
+        assert client.get(f"/api/sessions/{victim['session_id']}", headers=headers).status_code == 401
+        assert client.post("/api/sessions", headers=headers).status_code == 401
+    finally:
+        client.close()
+
+
+def test_offline_valid_cookie_keeps_cross_user_session_isolation(tmp_path, monkeypatch) -> None:
+    current = _runtime(tmp_path, cookie_secure=False, production=False)
+    monkeypatch.setattr(main_module, "get_services", lambda: current)
+    victim = current.store.create(owner_id="user:another_user")
+    client = _client()
+    try:
+        assert client.post(
+            "/api/auth/register",
+            json={"username": "offline_user", "password": "Correct-Horse-42"},
+        ).status_code == 201
+        created = client.post("/api/sessions")
+        assert created.status_code == 200
+        session_id = created.json()["session_id"]
+        assert current.store.get(session_id)["owner_id"] == "user:offline_user"
+        assert client.get(f"/api/sessions/{session_id}").status_code == 200
+        assert client.get(f"/api/sessions/{victim['session_id']}").status_code == 404
+        for headers in ({"Authorization": "Bearer arbitrary"}, {"X-API-Key": "arbitrary"}):
+            assert client.get(f"/api/sessions/{victim['session_id']}", headers=headers).status_code == 401
+    finally:
+        client.close()
+
+
+def test_offline_without_cookie_preserves_explicit_local_anonymous_mode(tmp_path, monkeypatch) -> None:
+    current = _runtime(tmp_path, cookie_secure=False, production=False)
+    monkeypatch.setattr(main_module, "get_services", lambda: current)
+    client = _client()
+    try:
+        response = client.post("/api/sessions")
+        assert response.status_code == 200
+        assert current.store.get(response.json()["session_id"])["owner_id"] == ""
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("valid_cookie", [True, False])
+def test_service_header_with_cookie_keeps_service_identity(tmp_path, monkeypatch, valid_cookie: bool) -> None:
+    current = _runtime(tmp_path, cookie_secure=False)
+    monkeypatch.setattr(main_module, "get_services", lambda: current)
+    client = _client()
+    try:
+        assert client.post(
+            "/api/auth/register",
+            json={"username": "browser_user", "password": "Correct-Horse-42"},
+        ).status_code == 201
+        browser_session = client.post("/api/sessions").json()["session_id"]
+        if not valid_cookie:
+            client.cookies.set(current.auth.cookie_name, "invalid-cookie")
+        headers = {"Authorization": "Bearer service-client-token"}
+        assert client.get(f"/api/sessions/{browser_session}", headers=headers).status_code == 404
+        service_session = client.post("/api/sessions", headers=headers)
+        assert service_session.status_code == 200
+        assert current.store.get(service_session.json()["session_id"])["owner_id"].startswith("service:")
+    finally:
+        client.close()
 
 
 @pytest.mark.parametrize(
