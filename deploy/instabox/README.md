@@ -48,7 +48,7 @@ API 启动前会从仓库的知识目录构建或复用 BM25 快照；首次构�
 
 Nginx 仅向内网 API 注入固定 `X-Forwarded-Proto: https`，前提是外部入口已经终止 TLS；它不根据用户提交的 XFF 或协议头建立身份。认证 Cookie 保留 `Secure`、`HttpOnly`、`SameSite=Strict`，UI 与 `/api` 必须同源，浏览器测试必须使用平台 HTTPS 地址。
 
-离线 API 原本不会强制登录，所以这个配置在业务 `location /api/` 中使用 `auth_request /_auth`，通过无请求体的内部 GET `/api/auth/me` 子请求校验账户 Cookie；未登录返回 401。登录、注册、注销和账户检查端点不受该子请求保护，避免递归。`/_auth` 只允许内部请求。
+离线 API 原本不会强制登录，所以这个配置在业务 `location /api/` 中使用 `auth_request /_auth`，通过无请求体的内部 GET `/api/auth/me` 子请求校验账户 Cookie；未登录返回 401。子请求和原始业务代理都会清空 `Authorization` 与 `X-API-Key`，业务身份仅从账户 Cookie 解析，避免服务凭据头使离线后端绕过用户会话归属。登录、注册、注销和账户检查端点不受该子请求保护，避免递归。`/_auth` 只允许内部请求。
 
 登录和注册保留每连接源地址每分钟 6 次、突发 3 次限制，业务 API 为每分钟 30 次、突发 10 次。不信任任意公网 XFF，平台代理下多个访问者可能共享限流预算。这些限制不能替代平台级防滥用保护。
 
