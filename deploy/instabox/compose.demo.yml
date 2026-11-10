@@ -1,0 +1,66 @@
+name: medguide-demo
+
+services:
+  medguide-api:
+    build:
+      context: ../..
+      dockerfile: backend/Dockerfile
+    environment:
+      # Explicit allowlist: never inherit provider credentials or endpoints.
+      MEDGUIDE_MODE: offline
+      MEDGUIDE_KNOWLEDGE_BACKEND: bm25
+      MEDGUIDE_AUTH_BACKEND: sqlite
+      MEDGUIDE_AUTH_DB_PATH: /app/data/runtime/auth.sqlite3
+      MEDGUIDE_AUTH_SESSION_TTL_SECONDS: "604800"
+      MEDGUIDE_AUTH_COOKIE_NAME: medguide_demo_session
+      MEDGUIDE_COOKIE_SECURE: "true"
+      MEDGUIDE_REQUIRE_HTTPS: "true"
+      MEDGUIDE_CORS_ORIGINS: ""
+      MEDGUIDE_SESSION_TTL_SECONDS: "86400"
+      BM25_INDEX_PATH: /app/data/runtime/bm25-index.json
+    expose:
+      - "8000"
+    volumes:
+      - type: bind
+        source: ${MEDGUIDE_RUNTIME_DIR:?Set MEDGUIDE_RUNTIME_DIR to a prepared persistent directory}
+        target: /app/data/runtime
+        bind:
+          create_host_path: false
+    # Offline conversation state is process-local: keep exactly one worker.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers", "--workers", "1"]
+    restart: unless-stopped
+    mem_limit: 1g
+
+  medguide-ui:
+    build:
+      context: ../..
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_DEMO_MODE: "true"
+    environment:
+      # The stock image's validation script requires these to match. This
+      # demo configuration intentionally never uses X-Forwarded-For as identity.
+      MEDGUIDE_NETWORK_SUBNET: ${MEDGUIDE_NETWORK_SUBNET:-172.30.90.0/24}
+      MEDGUIDE_TRUSTED_PROXY_CIDR: ${MEDGUIDE_NETWORK_SUBNET:-172.30.90.0/24}
+      MEDGUIDE_REQUIRE_HTTPS: "true"
+      NGINX_ENVSUBST_FILTER: "^MEDGUIDE_(TRUSTED_PROXY_CIDR|REQUIRE_HTTPS)"
+    ports:
+      - "${MEDGUIDE_BIND_ADDRESS:-127.0.0.1}:8080:80"
+    volumes:
+      - type: bind
+        source: ./nginx.demo.conf
+        target: /etc/nginx/templates/default.conf.template
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      medguide-api:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 128m
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${MEDGUIDE_NETWORK_SUBNET:-172.30.90.0/24}
