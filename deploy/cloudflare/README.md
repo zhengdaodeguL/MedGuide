@@ -42,6 +42,6 @@ node --test deploy/cloudflare/worker.test.mjs
 - 跨用户读取及写入会话均返回 404。
 - SSE 收到 9 个节点事件、1 个 `final` 事件和 2 条引用；首个节点约 2.2 秒返回，约 5.9 秒收齐。浏览器可查看参考资料。
 
-当前仍为离线演示，仅使用本地规则和示例资料，未上传模型凭据。域名绑定不改变 InstaBox 的休眠与连续运行限制，不代表 24×7 可用。真实客户端断连取消未验收。
+当前入口已接入 InstaBox 内的 Qwen3-1.7B 本地模型和 BM25 资料检索，未上传模型凭据；库存、排班和价格尚未连接医院业务系统。域名绑定不改变 InstaBox 的休眠与连续运行限制，不代表 24×7 可用。真实客户端断连取消未验收。
 
 官方依据（实现前核对）：[Fetch](https://developers.cloudflare.com/workers/runtime-apis/fetch/)、[Request / redirect 与缓存参数](https://developers.cloudflare.com/workers/runtime-apis/request/)、[Response / Set-Cookie](https://developers.cloudflare.com/workers/runtime-apis/response/)、[Streams](https://developers.cloudflare.com/workers/runtime-apis/streams/)。
