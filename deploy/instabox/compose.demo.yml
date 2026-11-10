@@ -12,7 +12,7 @@ services:
       MEDGUIDE_AUTH_BACKEND: sqlite
       MEDGUIDE_AUTH_DB_PATH: /app/data/runtime/auth.sqlite3
       MEDGUIDE_AUTH_SESSION_TTL_SECONDS: "604800"
-      MEDGUIDE_AUTH_COOKIE_NAME: medguide_demo_session
+      MEDGUIDE_AUTH_COOKIE_NAME: medguide_session
       MEDGUIDE_COOKIE_SECURE: "true"
       MEDGUIDE_REQUIRE_HTTPS: "true"
       MEDGUIDE_CORS_ORIGINS: ""
@@ -35,11 +35,9 @@ services:
     build:
       context: ../..
       dockerfile: frontend/Dockerfile
-      args:
-        VITE_DEMO_MODE: "true"
     environment:
       # The stock image's validation script requires these to match. This
-      # demo configuration intentionally never uses X-Forwarded-For as identity.
+      # This configuration intentionally never uses X-Forwarded-For as identity.
       MEDGUIDE_NETWORK_SUBNET: ${MEDGUIDE_NETWORK_SUBNET:-172.30.90.0/24}
       MEDGUIDE_TRUSTED_PROXY_CIDR: ${MEDGUIDE_NETWORK_SUBNET:-172.30.90.0/24}
       MEDGUIDE_REQUIRE_HTTPS: "true"
