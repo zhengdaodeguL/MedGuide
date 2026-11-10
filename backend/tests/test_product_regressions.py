@@ -154,8 +154,6 @@ def test_production_gateway_has_auth_throttling_and_strict_browser_headers() -> 
     assert "fonts.googleapis.com" not in styles
     compact_styles = re.sub(r"\s+", "", styles)
     workspace_rules = re.findall(r"\.workspace\{([^}]*)\}", compact_styles)
-    assert "--demo-notice-height:0px;" in compact_styles
-    assert ".demo-mode{--demo-notice-height:32px;}" in compact_styles
-    assert ".demo-mode{--demo-notice-height:48px;}" in compact_styles
-    assert any("height:calc(100dvh-var(--demo-notice-height)-64px)" in rule for rule in workspace_rules)
-    assert any("height:calc(100dvh-var(--demo-notice-height)-58px)" in rule for rule in workspace_rules)
+    assert "--demo-notice-height" not in compact_styles
+    assert any("height:calc(100dvh-64px)" in rule for rule in workspace_rules)
+    assert any("height:calc(100dvh-58px)" in rule for rule in workspace_rules)

@@ -18,6 +18,8 @@ MedGuide 是面向健康信息整理与就医指引的可审计服务。系统�
 
 ## 快速部署
 
+4 核 CPU / 8 GiB 内存的单机本地推理可使用 [InstaBox 本地模型部署](deploy/instabox/LOCAL_MODEL.md)：官方 Qwen3-1.7B + llama.cpp，不需要外部模型凭据。以下步骤适用于外部模型与共享存储的生产配置。
+
 ### 1. 准备配置
 
 ```powershell
@@ -58,7 +60,9 @@ API 容器会在进程启动前按知识后端准备索引。`bm25` 模式根据
 
 | 配置 | 作用 |
 | --- | --- |
-| `MEDGUIDE_MODE` | 生产部署设为 `production` |
+| `MEDGUIDE_MODE` | 外部模型与共享存储设为 `production`；单实例本地推理使用独立 `local` 配置 |
+| `MEDGUIDE_LOCAL_LLM_BASE_URL` / `MEDGUIDE_LOCAL_LLM_MODEL` | `local` 模式专用的本机模型地址和模型 ID，不继承 `OPENAI_*` |
+| `MEDGUIDE_LOCAL_LLM_TIMEOUT_SECONDS` / `MEDGUIDE_LOCAL_LLM_MAX_TOKENS` | 本地生成预算，默认 120 秒 / 512 token |
 | `MEDGUIDE_DOMAIN` | 已解析到部署主机的公网域名；TLS 网关启动时校验，缺失或非法则失败关闭 |
 | `MEDGUIDE_HTTP_PORT` / `MEDGUIDE_HTTPS_PORT` | TLS 网关对外发布端口，默认 80/443 |
 | `MEDGUIDE_CORS_ORIGINS` | 受控跨源部署的精确 Origin 列表；同源部署保持为空 |

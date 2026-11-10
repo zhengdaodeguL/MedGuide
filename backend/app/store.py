@@ -375,7 +375,9 @@ class SessionStore:
             "workflow_version": state.get("workflow_version", "2026.11"),
             "workflow_path": state.get("workflow_path", []),
             "workflow_skipped_nodes": state.get("workflow_skipped_nodes", []),
-            "environment": self.mode if self.mode in {"offline", "test"} else "production",
+            "answer_source": state.get("answer_source"),
+            "safety_blocked": bool(state.get("safety_blocked", False)),
+            "environment": self.mode if self.mode in {"offline", "test", "local"} else "production",
             "network_enabled": self.mode not in {"offline", "test"},
             "updated_at": state.get("updated_at"),
         }

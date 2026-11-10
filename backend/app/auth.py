@@ -138,7 +138,7 @@ class AuthStore:
         return self._requires_shared_backend
 
     @classmethod
-    def from_environment(cls, *, production: bool) -> AuthStore | MySQLAuthStore:
+    def from_environment(cls, *, production: bool, local: bool = False) -> AuthStore | MySQLAuthStore:
         project_root = Path(__file__).resolve().parents[2]
         configured_path = (os.getenv("MEDGUIDE_AUTH_DB_PATH") or "").strip()
         database_path = Path(configured_path) if configured_path else project_root / "data" / "runtime" / "auth.sqlite3"
@@ -147,7 +147,7 @@ class AuthStore:
         if backend not in {"sqlite", "mysql"}:
             raise ValueError("MEDGUIDE_AUTH_BACKEND must be mysql or sqlite")
         session_ttl = _environment_ttl()
-        cookie_secure = _environment_bool("MEDGUIDE_COOKIE_SECURE", default=production)
+        cookie_secure = _environment_bool("MEDGUIDE_COOKIE_SECURE", default=production or local)
         if production and backend == "mysql":
             auth_dsn = (os.getenv("MEDGUIDE_AUTH_DSN") or "").strip()
             if auth_dsn:

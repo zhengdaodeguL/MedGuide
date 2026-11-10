@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ipaddress
+import math
 import os
 from time import monotonic
 from typing import Any
@@ -10,7 +12,7 @@ from .version import __version__
 
 
 class OpenAIAnswerer:
-    """Optional production generator with a strict medical-safety system message."""
+    """Grounded generator with isolated local and production provider settings."""
 
     SYSTEM_PROMPT = (
         "你是 MedGuide 的健康信息整理助手。只能基于给定资料和用户已提供的信息回答。"
@@ -28,47 +30,77 @@ class OpenAIAnswerer:
         timeout: float | None = None,
         base_url: str | None = None,
     ) -> None:
-        configured_model = model if model is not None else os.getenv("OPENAI_MODEL", "")
+        mode = os.getenv("MEDGUIDE_MODE", "production").strip().lower()
+        self.local = mode == "local"
+        self.required = mode not in {"offline", "test"}
+        configured_model = (
+            os.getenv("MEDGUIDE_LOCAL_LLM_MODEL", "")
+            if self.local else (model if model is not None else os.getenv("OPENAI_MODEL", ""))
+        )
         self.model = configured_model.strip()
-        configured_base_url = base_url or os.getenv("OPENAI_CHAT_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+        configured_base_url = (
+            os.getenv("MEDGUIDE_LOCAL_LLM_BASE_URL")
+            if self.local else (base_url or os.getenv("OPENAI_CHAT_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
+        )
         self.base_url: str | None = None
         self.client: Any | None = None
         self.prompt: Any | None = None
         self.available = False
-        self.timeout = timeout if timeout is not None else self._read_timeout()
-        self.max_tokens = self._read_max_tokens()
+        self.timeout = self._read_local_timeout() if self.local else (timeout if timeout is not None else self._read_timeout())
+        self.max_tokens = self._read_local_max_tokens() if self.local else self._read_max_tokens()
         self.last_error: str | None = None
-        self._api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self._api_key = "" if self.local else (api_key or os.getenv("OPENAI_API_KEY"))
         self._retry_after = 0.0
         self._closed = False
         self._requires_probe = True
-        mode = os.getenv("MEDGUIDE_MODE", "production").strip().lower()
-        self.required = mode not in {"offline", "test"}
-        # Only production-like modes may instantiate an external
-        # provider.  Offline/test runs must remain deterministic even when a
-        # developer happens to have an API key in the environment.
-        self._enabled = bool(self._api_key and self.model and self.required)
+        # Local mode never inherits an external endpoint, credential, model,
+        # or request budget from the developer's OPENAI_* environment.
+        self._enabled = bool(
+            self.model and configured_base_url
+            if self.local else self._api_key and self.model and self.required
+        )
         if self.required and not self.model:
             # Model selection is part of the production provider contract.
             # Never silently route protected medical content to a fallback
             # model when deployment configuration is incomplete.
             self.last_error = "MissingModelConfiguration"
+        elif self.local and not configured_base_url:
+            self.last_error = "MissingLocalEndpointConfiguration"
+        if self.local and configured_base_url:
+            self.base_url = _normalize_local_base_url(configured_base_url)
         if not self._enabled:
             return
-        self.base_url = _normalize_base_url(configured_base_url)
+        if not self.local:
+            self.base_url = _normalize_base_url(configured_base_url)
         self._build_client()
 
     def _create_resources(self) -> tuple[Any, Any]:
         from openai import OpenAI
         from langchain_core.prompts import ChatPromptTemplate
 
-        client = OpenAI(
-            api_key=self._api_key,
-            base_url=self.base_url,
-            timeout=self.timeout,
-            max_retries=0,
-            default_headers={"User-Agent": f"MedGuide/{__version__}"},
-        )
+        local_options: dict[str, Any] = {}
+        if self.local:
+            import httpx
+
+            local_options = {
+                "organization": "",
+                "project": "",
+                "webhook_secret": "",
+                "http_client": httpx.Client(trust_env=False, follow_redirects=False, timeout=self.timeout),
+            }
+        try:
+            client = OpenAI(
+                api_key=self._api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+                max_retries=0,
+                default_headers={"User-Agent": f"MedGuide/{__version__}"},
+                **local_options,
+            )
+        except Exception:
+            if self.local:
+                local_options["http_client"].close()
+            raise
         try:
             prompt = ChatPromptTemplate.from_messages([
                 ("system", self.SYSTEM_PROMPT),
@@ -105,7 +137,7 @@ class OpenAIAnswerer:
         return True
 
     def _probe_client(self) -> bool:
-        """Confirm a rebuilt client against OpenAI without sending patient text."""
+        """Probe the configured generator without sending patient text."""
         if self.client is None:
             return False
         try:
@@ -116,7 +148,8 @@ class OpenAIAnswerer:
                 model=self.model,
                 messages=[{"role": "user", "content": self.READINESS_PROMPT}],
                 temperature=0,
-                max_tokens=256,
+                max_tokens=16 if self.local else 256,
+                **self._local_request_options(),
             )
             choices = getattr(response, "choices", None) or []
             content = getattr(getattr(choices[0], "message", None), "content", None) if choices else None
@@ -159,6 +192,27 @@ class OpenAIAnswerer:
         except ValueError:
             return 1600
 
+    @staticmethod
+    def _read_local_timeout() -> float:
+        try:
+            value = float(os.getenv("MEDGUIDE_LOCAL_LLM_TIMEOUT_SECONDS", "120"))
+            return max(1.0, min(value, 180.0)) if math.isfinite(value) else 120.0
+        except ValueError:
+            return 120.0
+
+    @staticmethod
+    def _read_local_max_tokens() -> int:
+        try:
+            return max(64, min(int(os.getenv("MEDGUIDE_LOCAL_LLM_MAX_TOKENS", "512")), 1024))
+        except ValueError:
+            return 512
+
+    def _local_request_options(self) -> dict[str, Any]:
+        return (
+            {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+            if getattr(self, "local", False) else {}
+        )
+
     def generate(self, query: str, risk: str, context: str) -> str | None:
         if not self.ensure_ready():
             return None
@@ -184,6 +238,7 @@ class OpenAIAnswerer:
                 messages=payload,
                 temperature=0.1,
                 max_tokens=self.max_tokens,
+                **self._local_request_options(),
             )
             choices = getattr(response, "choices", None) or []
             if not choices or getattr(choices[0], "finish_reason", None) == "length":
@@ -199,8 +254,8 @@ class OpenAIAnswerer:
             return content.strip()
         except Exception as exc:
             # Provider failures must never escape the API boundary.  The
-            # workflow treats ``None`` as a signal to use its grounded local
-            # template; retain only a short, non-sensitive diagnostic.
+            # workflow rejects required-provider failures; offline/test may
+            # use a grounded template. Retain only a non-sensitive diagnostic.
             self._mark_unavailable(exc)
             return None
 
@@ -237,6 +292,36 @@ class OpenAIAnswerer:
 
 
 _COMPLETION_ENDPOINT_SUFFIXES = ("/chat/completions", "/chaat/completions")
+
+
+def _normalize_local_base_url(value: str) -> str:
+    """Allow only an explicit loopback or fixed Compose model endpoint."""
+    raw = value.strip()
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname or ""
+        port = parsed.port
+        allowed_host = host in {"localhost", "medguide-llm"}
+        if not allowed_host and "%" not in host:
+            try:
+                allowed_host = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                pass
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not allowed_host
+            or parsed.username is not None
+            or parsed.password is not None
+            or "?" in raw
+            or "#" in raw
+            or any(character.isspace() for character in raw)
+            or parsed.path.rstrip("/") != "/v1"
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("MEDGUIDE_LOCAL_LLM_BASE_URL must be a local HTTP(S) /v1 endpoint") from exc
+    return urlunsplit((parsed.scheme, parsed.netloc, "/v1", "", ""))
 
 
 def _normalize_base_url(value: str | None) -> str | None:

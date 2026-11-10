@@ -58,8 +58,12 @@ logger = logging.getLogger(__name__)
 _citation_cleaner = MedicalDocumentCleaner()
 
 
-def _knowledge_backend(*, production: bool) -> str:
+def _knowledge_backend(*, production: bool, local: bool = False) -> str:
     configured = (os.getenv("MEDGUIDE_KNOWLEDGE_BACKEND") or "").strip().lower()
+    if local:
+        if configured and configured != "bm25":
+            raise ValueError("local mode requires the bm25 knowledge backend")
+        return "bm25"
     if not configured:
         return "milvus" if production else "memory"
     if configured not in _PRODUCTION_KNOWLEDGE_BACKENDS and configured != "memory":
@@ -134,7 +138,7 @@ def _request_uses_secure_transport(
 
 
 def _require_secure_transport(current: AppServices, request: Request) -> None:
-    if current.production and _environment_bool("MEDGUIDE_REQUIRE_HTTPS", default=True):
+    if (current.production or getattr(current, "local", False)) and _environment_bool("MEDGUIDE_REQUIRE_HTTPS", default=True):
         trusted_proxy_networks = getattr(current, "trusted_proxy_networks", None)
         if trusted_proxy_networks is None:
             trusted_proxy_networks = _trusted_proxy_networks()
@@ -227,15 +231,16 @@ def _configured_api_tokens() -> tuple[str, ...]:
 class AppServices:
     def __init__(self) -> None:
         self.mode = os.getenv("MEDGUIDE_MODE", "production").strip().lower() or "production"
-        production = self.mode not in {"offline", "test"}
+        self.local = self.mode == "local"
+        production = self.mode not in {"offline", "test", "local"}
         self.production = production
         # Parse once at startup so malformed proxy configuration cannot wait
         # until the first business request to fail, and reuse the exact same
         # trust boundary for every HTTPS gate.
         self.trusted_proxy_networks = _trusted_proxy_networks()
-        if production and not _secure_transport_configuration():
+        if (production or self.local) and not _secure_transport_configuration():
             raise ValueError(
-                "production requires MEDGUIDE_COOKIE_SECURE=true and MEDGUIDE_REQUIRE_HTTPS=true"
+                f"{self.mode} requires MEDGUIDE_COOKIE_SECURE=true and MEDGUIDE_REQUIRE_HTTPS=true"
             )
         self._readiness_lock = threading.Lock()
         self._readiness_cache_until = 0.0
@@ -243,7 +248,7 @@ class AppServices:
         self._readiness_cache_seconds = _readiness_cache_seconds()
         self._readiness_timeout_seconds = _readiness_timeout_seconds()
         self._readiness_future: Future[tuple[str, ...]] | None = None
-        self.knowledge_backend = _knowledge_backend(production=production)
+        self.knowledge_backend = _knowledge_backend(production=production, local=self.local)
         milvus_uri = (os.getenv("MILVUS_URI") or "").strip()
         mysql_dsn = (os.getenv("MYSQL_DSN") or "").strip()
         self.vector_search_enabled = production and self.knowledge_backend == "milvus"
@@ -254,7 +259,7 @@ class AppServices:
             in {"1", "true", "yes", "on"}
         )
         self.api_tokens = _configured_api_tokens()
-        self.auth = AuthStore.from_environment(production=production)
+        self.auth = AuthStore.from_environment(production=production, local=self.local)
         self.embedding_provider = (
             keyword_embedding_provider_from_env()
             if self.knowledge_backend == "bm25"
@@ -290,7 +295,10 @@ class AppServices:
         )
         # Supplying the disabled adapter in production prevents the bundled
         # query database from being mistaken for live operational data.
-        self.sql_guard = ReadOnlySQLGuard(backend=self.mysql if production else None)
+        self.sql_guard = ReadOnlySQLGuard(
+            backend=self.mysql if production or self.local else None,
+            unavailable_reason="尚未连接医院业务数据，无法查询实际库存、排班或价格" if self.local else None,
+        )
         self.safety = SafetyEngine()
         self.answerer = OpenAIAnswerer()
         self.metrics = MetricsStore(backend=self.redis if production else None)
@@ -390,7 +398,7 @@ class AppServices:
 
     def readiness_missing(self) -> tuple[str, ...]:
         """Bound each request's wait while sharing at most one dependency probe."""
-        if not self.production:
+        if not self.production and not getattr(self, "local", False):
             return self.knowledge_missing
         deadline = time.monotonic() + getattr(self, "_readiness_timeout_seconds", 5.0)
         timed_out = ("Dependency readiness timed out",)
@@ -409,7 +417,7 @@ class AppServices:
 
                 def probe() -> None:
                     try:
-                        missing = self.production_missing
+                        missing = self.local_missing if getattr(self, "local", False) else self.production_missing
                     except Exception as exc:
                         logger.warning("Dependency readiness failed: %s", type(exc).__name__)
                         missing = ("Dependency readiness failed",)
@@ -436,6 +444,13 @@ class AppServices:
             return future.result(timeout=max(0.0, deadline - time.monotonic()))
         except FutureTimeoutError:
             return timed_out
+
+    @property
+    def local_missing(self) -> tuple[str, ...]:
+        if getattr(self, "_closed", False):
+            return ("Service shutting down",)
+        ready = self.answerer.ensure_ready()
+        return (() if ready else ("本地生成服务",)) + self.knowledge_missing
 
 
 services: AppServices | None = None
@@ -550,7 +565,9 @@ def _require_access(
     # A proxy-validated cookie can expire or be revoked before this handler.
     # Cookie-bearing offline requests must not fall back to anonymous access;
     # production service-header priority remains unchanged.
-    if principal is None and (getattr(current, "production", False) or session_token is not None):
+    if principal is None and (
+        getattr(current, "production", False) or getattr(current, "local", False) or session_token is not None
+    ):
         raise HTTPException(status_code=401, detail="请先登录")
     _require_runtime(current)
     return principal
@@ -580,7 +597,8 @@ def _require_runtime(current: AppServices) -> None:
     missing_dependencies = readiness() if callable(readiness) else current.production_missing
     if missing_dependencies:
         missing = "、".join(missing_dependencies)
-        raise HTTPException(status_code=503, detail=f"生产依赖未就绪：{missing}；请检查配置和连通性")
+        label = "本地服务依赖" if getattr(current, "local", False) else "生产依赖"
+        raise HTTPException(status_code=503, detail=f"{label}未就绪：{missing}；请检查配置和连通性")
 
 
 def _require_auth_backend(current: AppServices) -> None:
@@ -814,6 +832,16 @@ def _readiness_payload(current: AppServices, dependencies_ready: bool) -> dict[s
         # corpus size, or adapter state. Internal operators can use an
         # authenticated service channel for detailed diagnostics.
         return summary
+    if getattr(current, "local", False):
+        return {
+            **summary,
+            "workflow": "langgraph-compatible" if current.workflow.langgraph_available else "deterministic",
+            "knowledge": current.retriever.health(),
+            "database": "not-configured",
+            "auth_database": "sqlite",
+            "cache": "in-memory-local",
+            "generator": f"local:{current.answerer.model}" if current.answerer.available else "local-unavailable",
+        }
     return {
         **summary,
         "workflow": "langgraph-compatible" if current.workflow.langgraph_available else "deterministic",
@@ -1076,7 +1104,8 @@ def chat(
     try:
         return _response_from_state(_run_chat_transaction(current, state))
     except WorkflowExecutionError as exc:
-        raise HTTPException(status_code=503, detail="外部生成服务暂时不可用，请稍后重试") from exc
+        label = "本地生成服务" if getattr(current, "local", False) else "外部生成服务"
+        raise HTTPException(status_code=503, detail=f"{label}暂时不可用，请稍后重试") from exc
     except SessionConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SessionBackendError as exc:
@@ -1180,7 +1209,8 @@ def stream_chat(current: AppServices, state: WorkflowState) -> StreamingResponse
             except SessionBackendError as exc:
                 schedule(("error", {"status": 503, "message": str(exc)}))
             except WorkflowExecutionError:
-                schedule(("error", {"status": 503, "message": "外部生成服务暂时不可用，请稍后重试"}))
+                label = "本地生成服务" if getattr(current, "local", False) else "外部生成服务"
+                schedule(("error", {"status": 503, "message": f"{label}暂时不可用，请稍后重试"}))
             except Exception:
                 # Do not expose provider/database internals through SSE.
                 schedule(("error", {"status": 500, "message": "整理服务暂时不可用，请稍后重试"}))

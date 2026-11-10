@@ -85,9 +85,12 @@ class ReadOnlySQLGuard:
     )
     _PREDICATE_OPERATORS = frozenset({"=", "!=", "<>", "<", "<=", ">", ">=", "like"})
 
-    def __init__(self, db_path: Path | None = None, backend: Any | None = None) -> None:
+    def __init__(
+        self, db_path: Path | None = None, backend: Any | None = None, unavailable_reason: str | None = None
+    ) -> None:
         self.db_path = db_path or Path(__file__).resolve().parents[2] / "data" / "runtime" / "medguide.sqlite3"
         self.backend = backend
+        self.unavailable_reason = unavailable_reason
         if self.backend is None:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._ensure_schema()
@@ -513,6 +516,8 @@ class ReadOnlySQLGuard:
                 ensure_ready = getattr(self.backend, "ensure_ready", None)
                 backend_ready = bool(ensure_ready()) if callable(ensure_ready) else bool(getattr(self.backend, "ready", False))
                 if not backend_ready:
+                    if self.unavailable_reason:
+                        return SQLQueryResult(intent, validated, params, (), (), blocked=True, reason=self.unavailable_reason)
                     raise RuntimeError("MySQL adapter is not ready")
                 columns, rows = self.backend.execute(validated, params)
             else:
@@ -538,6 +543,8 @@ class ReadOnlySQLGuard:
         normalized = text.strip()
         if not any(word in normalized for word in ("库存", "有货", "排班", "号源", "价格", "多少钱", "费用")):
             return None
+        if self.unavailable_reason:
+            return SQLQueryResult("structured", "", (), (), (), blocked=True, reason=self.unavailable_reason)
         if any(word in normalized for word in ("库存", "有货")):
             drug = self._extract_term(normalized, ("库存", "有货", "药品"))
             if not drug:

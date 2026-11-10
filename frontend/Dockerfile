@@ -4,8 +4,7 @@ WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend ./
-ARG VITE_DEMO_MODE=false
-RUN VITE_DEMO_MODE="$VITE_DEMO_MODE" npm run build
+RUN npm run build
 
 FROM nginx:1.27-alpine
 

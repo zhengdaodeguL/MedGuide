@@ -666,7 +666,10 @@ class MedGuideWorkflow:
         elif state.get("structured_result"):
             result = state["structured_result"]
             if result.get("blocked"):
-                response = f"为了保护数据安全，这次查询没有执行：{result.get('reason')}。可以换成查询药品库存、科室排班或检查价格。"
+                if getattr(self.answerer, "local", False) and str(result.get("reason", "")).startswith("尚未连接医院业务数据"):
+                    response = f"{result['reason']}。请通过医院官方渠道确认相关信息。"
+                else:
+                    response = f"为了保护数据安全，这次查询没有执行：{result.get('reason')}。可以换成查询药品库存、科室排班或检查价格。"
             elif result.get("rows"):
                 response = self._format_rows(result)
             else:
@@ -689,9 +692,10 @@ class MedGuideWorkflow:
                 )
                 if generated:
                     response = generated
-                    state["answer_source"] = "openai-grounded"
+                    state["answer_source"] = "local-grounded" if getattr(self.answerer, "local", False) else "openai-grounded"
                 elif getattr(self.answerer, "required", False):
-                    raise WorkflowExecutionError("外部生成服务暂时不可用")
+                    label = "本地生成服务" if getattr(self.answerer, "local", False) else "外部生成服务"
+                    raise WorkflowExecutionError(f"{label}暂时不可用")
                 else:
                     lead = citations[0]["snippet"]
                     response = f"根据当前知识库，和你描述最相关的资料是“{citations[0]['title']}”：{lead}"

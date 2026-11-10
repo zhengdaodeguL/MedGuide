@@ -12,3 +12,5 @@ data/runtime/
 .playwright-cli/
 output/
 .*-backups/
+*.gguf
+*.gguf.part
