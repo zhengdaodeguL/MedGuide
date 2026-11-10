@@ -216,7 +216,13 @@ def test_session_deleted_before_commit_is_not_saved_or_recorded() -> None:
     assert recorded == []
 
 
-def test_old_request_replay_keeps_original_answer_and_current_medical_state(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("original_source", "original_blocked"),
+    [("local-grounded", False), ("safety-rules", False), ("safety-review", True)],
+)
+def test_old_request_replay_keeps_original_answer_and_current_medical_state(
+    monkeypatch, original_source: str, original_blocked: bool,
+) -> None:
     class Workflow:
         calls = 0
 
@@ -226,7 +232,8 @@ def test_old_request_replay_keeps_original_answer_and_current_medical_state(monk
             profile = deepcopy(state.get("profile", {}))
             if turn == 2:
                 profile.update({"age": 32, "duration": "3天"})
-            return {
+            blocked = original_blocked if turn == 1 else not original_blocked
+            result = {
                 **state,
                 "turn_count": turn,
                 "profile": profile,
@@ -241,7 +248,14 @@ def test_old_request_replay_keeps_original_answer_and_current_medical_state(monk
                 "workflow_version": f"test-version-{turn}",
                 "workflow_path": ["retrieve"] if turn == 1 else ["structured_query"],
                 "workflow_skipped_nodes": ["structured_query"] if turn == 1 else ["retrieve"],
+                "answer_source": original_source if turn == 1 else ("safety-review" if blocked else "local-grounded"),
+                "safety_blocked": blocked,
             }
+            if blocked:
+                result["safety_block_reason"] = f"unsafe-medical-instruction-{turn}"
+            else:
+                result.pop("safety_block_reason", None)
+            return result
 
     store = SessionStore(mode="test")
     workflow = Workflow()
@@ -277,6 +291,12 @@ def test_old_request_replay_keeps_original_answer_and_current_medical_state(monk
         assert result["workflow_version"] == "test-version-1"
         assert result["workflow_path"] == ["retrieve"]
         assert result["workflow_skipped_nodes"] == ["structured_query"]
+        assert result["answer_source"] == original_source
+        assert result["safety_blocked"] is original_blocked
+        if original_blocked:
+            assert result["safety_block_reason"] == "unsafe-medical-instruction-1"
+        else:
+            assert "safety_block_reason" not in result
         assert result["turn_count"] == 2
         assert result["profile"] == {"symptoms": [], "associated_symptoms": [], "age": 32, "duration": "3天"}
         assert result["summary"] == "current-summary-2"
@@ -300,6 +320,8 @@ def test_old_request_replay_keeps_original_answer_and_current_medical_state(monk
     assert payload["state"]["workflow_version"] == "test-version-1"
     assert payload["state"]["workflow_path"] == ["retrieve"]
     assert payload["state"]["workflow_skipped_nodes"] == ["structured_query"]
+    assert payload["state"]["answer_source"] == original_source
+    assert payload["state"]["safety_blocked"] is original_blocked
     assert workflow.calls == 2
 
 

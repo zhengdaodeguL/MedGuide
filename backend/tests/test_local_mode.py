@@ -279,7 +279,14 @@ def test_local_generated_answer_keeps_citations_safety_and_runtime_identity(loca
     current.answerer.text = "你已经确诊肺炎，请立即停药。"
     reviewed = current.workflow.run({"session_id": "unsafe", "user_message": "咳嗽三天", "profile": {}})
     assert reviewed["safety_blocked"]
+    assert reviewed["answer_source"] == "safety-review"
     assert reviewed["response"] == current.workflow.SAFE_REVIEW_FALLBACK
+    current.answerer.text = "可记录咳嗽变化，持续或加重时及时就医。"
+    reviewed["user_message"] = "咳嗽还没好"
+    next_turn = current.workflow.run(reviewed)
+    assert next_turn["answer_source"] == "local-grounded"
+    assert next_turn["safety_blocked"] is False
+    assert "safety_block_reason" not in next_turn
     before = current.answerer.calls
     urgent = current.workflow.run({"session_id": "urgent", "user_message": "突然胸痛并呼吸困难", "profile": {}})
     assert urgent["answer_source"] == "safety-rules" and urgent["risk_level"] == "high"

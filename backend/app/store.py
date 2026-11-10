@@ -23,6 +23,9 @@ _REQUEST_RESPONSE_FIELDS = (
     "workflow_version",
     "workflow_path",
     "workflow_skipped_nodes",
+    "answer_source",
+    "safety_blocked",
+    "safety_block_reason",
 )
 
 

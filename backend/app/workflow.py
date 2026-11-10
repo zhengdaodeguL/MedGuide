@@ -251,6 +251,7 @@ class MedGuideWorkflow:
         state["citations"] = []
         state["structured_result"] = None
         state["rewritten_query"] = ""
+        state.pop("safety_block_reason", None)
         if self.graph is not None and on_event is None and cancel_event is None:
             try:
                 # ``stream(..., updates)`` is the current LangGraph execution
@@ -769,6 +770,7 @@ class MedGuideWorkflow:
         compact_response = re.sub(r"\s+", "", response)
         if self._contains_unsafe_output(response, compact_response):
             state["response"] = self.SAFE_REVIEW_FALLBACK
+            state["answer_source"] = "safety-review"
             state["safety_blocked"] = True
             state["safety_block_reason"] = "unsafe-medical-instruction"
             return state
@@ -776,6 +778,7 @@ class MedGuideWorkflow:
             response += "\n\n提示：MedGuide 不替代医生诊断或处方。"
         state["response"] = response
         state["safety_blocked"] = False
+        state.pop("safety_block_reason", None)
         return state
 
     @classmethod
