@@ -1,0 +1,19 @@
+{
+  "account_id": "3ad140c52d098e41ee3957fb6ec68ffc",
+  "name": "medguide-domain-gateway",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-10",
+  "compatibility_flags": [],
+  "workers_dev": true,
+  "preview_urls": false,
+  "send_metrics": false,
+  "routes": [
+    {
+      "pattern": "medguide.kdns.fr",
+      "custom_domain": true
+    }
+  ],
+  "observability": {
+    "enabled": false
+  }
+}
