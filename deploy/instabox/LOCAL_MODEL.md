@@ -48,7 +48,7 @@ docker compose @compose up -d --wait medguide-api medguide-ui
 docker compose @compose ps
 ```
 
-本地模式使用 `MEDGUIDE_LOCAL_LLM_BASE_URL`、`MEDGUIDE_LOCAL_LLM_MODEL`、`MEDGUIDE_LOCAL_LLM_TIMEOUT_SECONDS`、`MEDGUIDE_LOCAL_LLM_MAX_TOKENS`。不要把本机原有供应商配置或 `.env` 复制到实例。持久目录中的模型权重不要提交到 Git。
+本地模式使用 `MEDGUIDE_LOCAL_LLM_BASE_URL`、`MEDGUIDE_LOCAL_LLM_MODEL`、`MEDGUIDE_LOCAL_LLM_TIMEOUT_SECONDS`、`MEDGUIDE_LOCAL_LLM_MAX_TOKENS`。推理服务是 Ollama 时另设 `MEDGUIDE_LOCAL_LLM_PROVIDER=ollama`（发送 `reasoning_effort=none` 关闭思考，否则 readiness probe 的 token 会被思考占满而返回空正文）；默认 `llama.cpp` 发送 `chat_template_kwargs.enable_thinking=false`。不要把本机原有供应商配置或 `.env` 复制到实例。持久目录中的模型权重不要提交到 Git。
 
 ## 能力与边界
 

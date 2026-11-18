@@ -12,6 +12,7 @@ from app.ingestion import DocumentChunk, MedicalDocumentCleaner, load_catalog
 from app.main import _response_from_state, _sanitize_citation_payload, app, public_state, stream_chat
 from app.models import Citation
 from app.store import SessionStore
+from conftest import login_client
 
 
 def _citation(**overrides: object) -> dict[str, object]:
@@ -140,6 +141,7 @@ def test_search_sanitizes_citations_before_computing_count(monkeypatch) -> None:
     invalid = Citation(**{**valid.__dict__, "id": "patient@example.org"})
 
     with TestClient(app, base_url="https://testserver") as client:
+        login_client(client, "citation_test_user")
         monkeypatch.setattr(main_module.get_services().retriever, "search", lambda *_args, **_kwargs: [valid, invalid])
         response = client.post("/api/search", json={"query": "咳嗽", "intent": "disease"})
 
