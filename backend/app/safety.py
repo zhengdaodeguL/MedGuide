@@ -66,7 +66,12 @@ class SafetyEngine:
         "？",
         "?",
     )
-    _HELP_SEEKING = (
+    # Action-seeking cues: asking what to do about a symptom implies the
+    # symptom is current, so they override a trailing question mark.  Pure
+    # severity questions ("严重吗", "危险吗", "要紧吗") are deliberately NOT
+    # in this list: asking whether chest pain is serious does not assert
+    # that the patient has chest pain right now.
+    _ACTION_SEEKING = (
         "怎么办",
         "如何处理",
         "需要就医",
@@ -74,10 +79,8 @@ class SafetyEngine:
         "要去医院",
         "该去医院",
         "该挂什么",
-        "严重吗",
-        "危险吗",
-        "要紧吗",
     )
+    _HELP_SEEKING = _ACTION_SEEKING
     _THIRD_PARTY = re.compile(
         r"朋友|家人|父亲|母亲|爸爸|妈妈|儿子|女儿|丈夫|妻子|老公|老婆|同事|邻居|"
         r"男朋友|女朋友|他人|他们|她们|(?:他|她)(?=(?:也|都|又|还|刚|今天|昨天|"
@@ -105,6 +108,25 @@ class SafetyEngine:
         r"(?:明显|完全)?"
         r"(?:缓解|消失|好转|恢复)"
     )
+    # Colloquial resolution: "昨天胸痛，今天好了" / "胸痛不疼了" / "好多了".
+    # No 已经/已 prefix is required, so this also covers "今天好了".
+    _RESOLVED_COLLOQUIAL_AFTER = re.compile(
+        r"^(?:[，,。；;]\s*(?:但是|但)?\s*(?:我|本人|患者|症状)?\s*(?:目前|现在|如今|今天|昨天)?)?"
+        r"(?:已经|已|现已)?(?:好了|不疼了|不痛了|好多了|没事了)"
+    )
+    _RECURRENCE_AFTER = re.compile(
+        r"(?:复发|加重|未完全(?:缓解|消失|好转|恢复)|"
+        r"(?:又|再次|重新)[^，,。；;！？!?]{0,12}(?:出现|发作|疼|痛|闷|喘|呼吸|无力|出血|黑便))"
+    )
+
+    @classmethod
+    def _is_resolved_after(cls, after: str) -> bool:
+        """Whether the text after a symptom says it has resolved (and not relapsed)."""
+        for pattern in (cls._RESOLVED_AFTER, cls._RESOLVED_COLLOQUIAL_AFTER):
+            match = pattern.match(after)
+            if match and not cls._RECURRENCE_AFTER.search(after[match.end():]):
+                return True
+        return False
     _CLAUSE_BREAK = re.compile(r"[，,。；;！？!?]|但是|但|可是|然而|却")
     _DIRECT_NEGATION = re.compile(
         r"(?:没有|无|否认|不曾|从未|不是|并非|未见|没|不再|未|不伴有|不伴随)"
@@ -155,12 +177,7 @@ class SafetyEngine:
                 continue
             if cls._RESOLVED_BEFORE.search(clause_before):
                 continue
-            resolved = cls._RESOLVED_AFTER.match(after)
-            if resolved and not re.search(
-                r"(?:复发|加重|未完全(?:缓解|消失|好转|恢复)|"
-                r"(?:又|再次|重新)[^，,。；;！？!?]{0,12}(?:出现|发作|疼|痛|闷|喘|呼吸|无力|出血|黑便))",
-                after[resolved.end():],
-            ):
+            if cls._is_resolved_after(after):
                 continue
             if re.match(r"(?:不再|已经没有|已没有|未见|不存在)", clause_after):
                 continue
@@ -186,13 +203,13 @@ class SafetyEngine:
             knowledge_prefix = cls._KNOWLEDGE_PREFIX.search(clause_before)
             knowledge_suffix = cls._KNOWLEDGE_SUFFIX.fullmatch(clause_after)
             if (knowledge_prefix or (knowledge_suffix and not cls._PATIENT_MARKER.search(clause_before))) and not any(
-                marker in full_clause for marker in cls._HELP_SEEKING
+                marker in full_clause for marker in cls._ACTION_SEEKING
             ):
                 continue
             is_question = any(marker in clause_after for marker in ("吗", "？", "?")) or any(
                 clause_after.startswith(marker) for marker in cls._QUESTION if marker not in ("吗", "？", "?")
             )
-            if is_question and not any(marker in full_clause for marker in cls._HELP_SEEKING):
+            if is_question and not any(marker in full_clause for marker in cls._ACTION_SEEKING):
                 continue
             return True
         return False
@@ -234,17 +251,23 @@ class SafetyEngine:
                 self._TEMPERATURE_NEGATION.search(clause_before)
                 or re.match(r"(?:以下|以内|之下|不到)", clause_after)
             )
+            # A trailing severity question ("39度严重吗") is a question about
+            # the number, not an assertion of a current 39° fever.  Only an
+            # action-seeking cue ("怎么办") keeps it high-risk.
             is_question = bool(
                 self._TEMPERATURE_QUESTION.search(clause_before)
-                or clause_after.startswith(("吗", "是否", "是不是", "有无", "有没有"))
+                or "吗" in clause_after
+                or "？" in clause_after
+                or "?" in clause_after
+                or clause_after.startswith(("是否", "是不是", "有无", "有没有"))
                 or after.startswith(("？", "?"))
-            ) and not any(marker in f"{clause_before}{match.group(0)}{clause_after}" for marker in self._HELP_SEEKING)
-            if value >= 39 and not is_negated and not is_question:
+            ) and not any(marker in f"{clause_before}{match.group(0)}{clause_after}" for marker in self._ACTION_SEEKING)
+            if value >= 39 and not is_negated and not is_question and not self._is_resolved_after(after):
                 flags.append("高热伴精神状态异常")
                 break
 
         if flags:
-            advice = "建议立即联系当地急救服务或前往最近的急诊；不要仅依赖线上问答等待观察。"
+            advice = "请立即拨打 120（中国大陆急救电话）或前往最近的急诊；不要仅依赖线上问答等待观察。"
             return RiskAssessment("high", tuple(dict.fromkeys(flags)), advice)
 
         watch_flags = [

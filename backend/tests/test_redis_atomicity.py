@@ -46,6 +46,8 @@ class _AtomicRedis:
                 return self._release_request(keys, args)
             if script == RedisSessionAdapter._UPSERT_FEEDBACK_SCRIPT:
                 return self._upsert_feedback(keys, args)
+            if script == RedisSessionAdapter._REMOVE_FEEDBACK_SCRIPT:
+                return self._remove_feedback(keys, args)
             if script == RedisSessionAdapter._RECORD_METRICS_SCRIPT:
                 return self._record_metrics(keys, args)
         raise AssertionError("unexpected Lua script")
@@ -112,20 +114,43 @@ class _AtomicRedis:
 
     def _upsert_feedback(self, keys, args):
         feedback_key, metrics_key = keys
-        field, rating, commented, _ttl = args
+        field, rating, comment, session_id, message_id, _ttl = args
         feedback = self.hashes.setdefault(feedback_key, {})
         metrics = self.hashes.setdefault(metrics_key, {})
         previous = feedback.get(field)
-        if previous == rating:
+        stored_comment = feedback.get(f"{field}:comment")
+        comment_changed = bool(comment) and stored_comment != comment
+        if previous == rating and not comment_changed:
             return 0
         if previous in {"up", "down"}:
-            old_key = f"feedback_{previous}"
-            metrics[old_key] = int(metrics.get(old_key, 0)) - 1
+            if previous != rating:
+                old_key = f"feedback_{previous}"
+                metrics[old_key] = int(metrics.get(old_key, 0)) - 1
+                metrics[f"feedback_{rating}"] = int(metrics.get(f"feedback_{rating}", 0)) + 1
+        else:
+            metrics[f"feedback_{rating}"] = int(metrics.get(f"feedback_{rating}", 0)) + 1
         feedback[field] = rating
-        rating_key = f"feedback_{rating}"
-        metrics[rating_key] = int(metrics.get(rating_key, 0)) + 1
-        if commented == "1" and previous is None:
-            metrics["feedback_commented"] = int(metrics.get("feedback_commented", 0)) + 1
+        if comment_changed:
+            feedback[f"{field}:comment"] = comment
+            feedback[f"{field}:session_id"] = session_id
+            feedback[f"{field}:message_id"] = message_id
+            if not stored_comment:
+                metrics["feedback_commented"] = int(metrics.get("feedback_commented", 0)) + 1
+        metrics["feedback_comment_seq"] = int(metrics.get("feedback_comment_seq", 0)) + 1
+        feedback[f"{field}:seq"] = metrics["feedback_comment_seq"]
+        return 1
+
+    def _remove_feedback(self, keys, args):
+        feedback_key, metrics_key = keys
+        field, _ttl = args
+        feedback = self.hashes.setdefault(feedback_key, {})
+        metrics = self.hashes.setdefault(metrics_key, {})
+        previous = feedback.get(field)
+        if previous not in {"up", "down"}:
+            return 0
+        del feedback[field]
+        old_key = f"feedback_{previous}"
+        metrics[old_key] = int(metrics.get(old_key, 0)) - 1
         return 1
 
     def _record_metrics(self, keys, args):
@@ -298,6 +323,75 @@ def test_feedback_upsert_is_atomic_under_concurrent_duplicates_and_changes() -> 
     metrics = redis.hashes[adapter.metrics_key]
     assert metrics["feedback_up"] == 0
     assert metrics["feedback_down"] == 1
+
+
+def test_feedback_comment_counts_once_per_message_in_shared_store() -> None:
+    redis = _AtomicRedis()
+    adapter = RedisSessionAdapter(client=redis)
+
+    # First comment on the message counts, even on a rating change.
+    assert adapter.upsert_feedback("session", "message", "up") is True
+    assert adapter.upsert_feedback("session", "message", "down", "不好") is True
+    # Same rating with a new comment: the comment is recorded (changed),
+    # but the message is still counted once in feedback_commented.
+    assert adapter.upsert_feedback("session", "message", "down", "还是不好") is True
+    assert adapter.upsert_feedback("session", "message", "down") is False
+    metrics = redis.hashes[adapter.metrics_key]
+    assert metrics["feedback_commented"] == 1
+    assert metrics["feedback_down"] == 1
+    assert metrics.get("feedback_up", 0) == 0
+
+
+def test_feedback_remove_is_atomic_under_concurrent_revokes() -> None:
+    redis = _AtomicRedis()
+    adapter = RedisSessionAdapter(client=redis)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        first_changes = list(
+            pool.map(lambda _: adapter.upsert_feedback("session", "message", "up"), range(64))
+        )
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        removes = list(
+            pool.map(lambda _: adapter.remove_feedback("session", "message"), range(64))
+        )
+
+    assert sum(bool(changed) for changed in first_changes) == 1
+    assert sum(bool(changed) for changed in removes) == 1
+    metrics = redis.hashes[adapter.metrics_key]
+    assert metrics["feedback_up"] == 0
+    assert adapter.remove_feedback("session", "message") is False
+
+
+def test_feedback_comments_round_trip_through_redis() -> None:
+    """Issue #21: comment text survives the Redis upsert and reads back."""
+    redis = _AtomicRedis()
+    adapter = RedisSessionAdapter(client=redis)
+    store = MetricsStore(backend=adapter)
+
+    assert store.add_feedback("up", "回答很清楚", "message-1", session_id="session-1") is True
+    assert store.add_feedback("up", "回答很清楚", "message-1", session_id="session-1") is False
+    assert store.add_feedback("up", "补充一点：希望更简短", "message-1", session_id="session-1") is True
+    assert store.add_feedback("down", None, "message-1", session_id="session-1") is True
+    # A blank comment is no comment: it changes nothing and counts nothing.
+    assert store.add_feedback("up", "   ", "message-2", session_id="session-1") is True
+    assert store.add_feedback("up", "", "message-2", session_id="session-1") is False
+
+    comments = store.feedback_comments()
+    assert len(comments) == 1
+    assert comments[0] == {
+        "session_id": "session-1",
+        "message_id": "message-1",
+        "rating": "down",
+        "comment": "补充一点：希望更简短",
+        "seq": 3,
+    }
+    assert store.snapshot()["feedback"].get("commented") == 1
+
+    # A second commented message reads back in update order.
+    assert store.add_feedback("down", "答非所问", "message-2", session_id="session-2") is True
+    comments = store.feedback_comments()
+    assert [item["message_id"] for item in comments] == ["message-1", "message-2"]
+    assert store.snapshot()["feedback"].get("commented") == 2
 
 
 def test_shared_metrics_record_is_atomic_and_deduplicated_under_concurrency() -> None:
