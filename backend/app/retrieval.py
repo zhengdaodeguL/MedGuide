@@ -5,7 +5,7 @@ import math
 import os
 import re
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from time import monotonic
 from typing import Any
 
@@ -18,7 +18,15 @@ from .infra import _adapter_retry_delay, _adapter_timeout
 
 class IntentRouter:
     KEYWORDS: dict[Intent, tuple[str, ...]] = {
-        "drug": ("药", "用药", "剂量", "副作用", "禁忌", "服用"),
+        "drug": (
+            "药", "用药", "剂量", "副作用", "禁忌", "服用",
+            # How to take a medicine is a drug question even when the drug
+            # name itself is the only drug word in the sentence, e.g.
+            # "布洛芬怎么吃？有什么注意事项？" used to fall through to "faq"
+            # on "注意事项" and then retrieve nothing.
+            "怎么吃", "如何吃", "怎么服用", "如何服用", "吃法", "用法", "用量",
+            "能吃吗", "可以吃吗",
+        ),
         "exam": ("检查", "检验", "化验", "指标", "报告", "价格", "多少钱"),
         "department": (
             "科室", "挂什么号", "挂什么科", "挂哪个科", "看什么科", "去哪个科",
@@ -32,14 +40,37 @@ class IntentRouter:
         "structured": ("库存", "有货", "排班", "号源", "价格", "多少钱", "费用"),
     }
 
+    def __init__(self, drug_names: Iterable[str] | None = None) -> None:
+        # Drug names are supplied by the caller (the workflow passes the
+        # names of the drug documents in the knowledge catalog).  A bare
+        # router still works: the usage patterns in KEYWORDS["drug"] cover
+        # questions such as "布洛芬怎么吃".
+        self.drug_names = tuple(
+            dict.fromkeys(name.strip() for name in (drug_names or ()) if name and name.strip())
+        )
+
+    # Score ties are broken by an explicit priority instead of dict order:
+    # an explicit "which department" question wins over a bare symptom
+    # mention ("咳嗽三天应该挂什么科？" is a department question), while a
+    # symptom plus a drug mention ("发热吃药") stays a disease question.
+    _INTENT_PRIORITY: tuple[Intent, ...] = ("department", "disease", "drug", "exam", "faq")
+
     def classify(self, text: str) -> Intent:
         normalized = text.lower()
         structured = sum(1 for word in self.KEYWORDS["structured"] if word in normalized)
         if structured and any(word in normalized for word in ("库存", "有货", "排班", "号源", "价格", "多少钱", "费用")):
             return "structured"
         scores = {intent: sum(1 for word in words if word in normalized) for intent, words in self.KEYWORDS.items() if intent != "structured"}
-        best = max(scores, key=scores.get)
-        return best if scores[best] else "unknown"
+        for name in self.drug_names:
+            if name.lower() in normalized:
+                scores["drug"] = scores.get("drug", 0) + 1
+        best: Intent = "unknown"
+        best_score = 0
+        for intent in self._INTENT_PRIORITY:
+            if scores[intent] > best_score:
+                best = intent
+                best_score = scores[intent]
+        return best if best_score else "unknown"
 
     def rewrite(self, text: str, profile: PatientProfile | None = None) -> str:
         profile = profile or {}
@@ -163,6 +194,39 @@ class HybridRetriever:
         catalog = self.knowledge_dir / "catalog.json"
         return load_catalog(catalog)
 
+    @property
+    def drug_names(self) -> tuple[str, ...]:
+        """Drug-related terms from the drug documents in the catalog.
+
+        Tags are curated per document, but some are generic clinical words
+        (e.g. "过敏", "皮疹") that belong to symptoms or other intents, so
+        they are filtered out: only terms that are not part of the shared
+        clinical vocabulary and not a keyword of another intent may vote
+        for the drug intent.
+        """
+        other_keywords = {
+            word
+            for intent, words in IntentRouter.KEYWORDS.items()
+            if intent != "drug"
+            for word in words
+        }
+        clinical_terms = set(MedicalDocumentCleaner._EMBEDDING_QUERY_TERMS)
+        # "止痛" and "退热" are effects, not drug names: as intent signals
+        # they would outvote the disease intent on symptom questions such
+        # as "发烧怎么退热" or "头痛怎么止痛".
+        effect_words = {"止痛", "退热"}
+        names = {
+            tag.strip()
+            for document in self.documents
+            if document.category == "drug"
+            for tag in document.tags
+            if tag and tag.strip()
+            and tag.strip() not in other_keywords
+            and tag.strip() not in clinical_terms
+            and tag.strip() not in effect_words
+        }
+        return tuple(sorted(names))
+
     @staticmethod
     def _cosine(left: list[float], right: list[float]) -> float:
         return sum(a * b for a, b in zip(left, right))
@@ -188,10 +252,11 @@ class HybridRetriever:
             intent=intent,
             allowed_terms=self._embedding_query_terms,
         )
-        provider_name = str(getattr(self.embedding_provider.spec, "provider", ""))
-        should_embed = self.remote_required or (
-            self.local_vector_search and provider_name != "local"
-        )
+        # The local Hash provider is a real embedding provider in test and
+        # offline modes; excluding it left the precomputed _local_vectors
+        # unused and every citation labelled "bm25". Embed whenever local
+        # vector search is enabled, regardless of provider.
+        should_embed = self.remote_required or self.local_vector_search
         if should_embed and self.embedding_provider.available:
             try:
                 query_vector = self.embedding_provider.embed([embedding_query])[0]
@@ -238,19 +303,19 @@ class HybridRetriever:
                     mark_unavailable()
 
         candidates_by_id: dict[str, dict[str, Any]] = {
-            hit.chunk.id: {"chunk": hit.chunk, "bm25": hit.score, "vector": 0.0}
+            hit.chunk.id: {"chunk": hit.chunk, "bm25": hit.score, "vector": 0.0, "vector_source": None}
             for hit in lexical_hits
         }
         if (
             self.local_vector_search
             and not self.remote_required
-            and provider_name != "local"
             and query_vector is not None
         ):
             for candidate in candidates_by_id.values():
                 local_vector = self._local_vectors.get(candidate["chunk"].id)
                 if local_vector is not None:
                     candidate["vector"] = self._cosine(query_vector, local_vector)
+                    candidate["vector_source"] = "local"
         for hit_id, hit in remote_hits.items():
             text = self.cleaner.clean(str(hit.get("text", "")))
             if not text:
@@ -275,9 +340,10 @@ class HybridRetriever:
                 continue
             candidate = candidates_by_id.get(hit_id)
             if candidate is None:
-                candidate = {"chunk": remote_chunk, "bm25": 0.0, "vector": 0.0}
+                candidate = {"chunk": remote_chunk, "bm25": 0.0, "vector": 0.0, "vector_source": None}
                 candidates_by_id[hit_id] = candidate
             candidate["vector"] = self._remote_score(hit) or 0.0
+            candidate["vector_source"] = "remote"
 
         candidates: list[tuple[float, float, float, DocumentChunk]] = []
         for candidate in candidates_by_id.values():
@@ -287,7 +353,16 @@ class HybridRetriever:
             lexical_score = bm25 / (bm25 + 5.0) if bm25 > 0 else 0.0
             intent_boost = 0.08 if chunk.metadata.get("category") == intent else 0.0
             if bm25 > 0 and vector > 0:
-                fused = 0.72 * vector + 0.20 * lexical_score + intent_boost
+                if candidate.get("vector_source") == "local":
+                    # Local vectors are 64-dim token hashes, a much weaker
+                    # relevance signal than dense remote embeddings: the
+                    # same weights would let hash collisions outrank BM25
+                    # (e.g. an X-ray doc outranking the blood-test doc for
+                    # a 血常规 query). Let BM25 carry the ranking and use
+                    # the local vector as a secondary cue.
+                    fused = 0.25 * vector + 0.60 * lexical_score + intent_boost
+                else:
+                    fused = 0.72 * vector + 0.20 * lexical_score + intent_boost
             elif vector > 0:
                 fused = 0.84 * vector + intent_boost
             else:
@@ -351,14 +426,15 @@ class HybridRetriever:
             if self.milvus is not None and getattr(self.milvus, "ready", False)
             else ("milvus-unavailable" if self.remote_required else "disabled")
         )
-        provider_name = str(getattr(self.embedding_provider.spec, "provider", ""))
         indexed_chunks = self.bm25_index.chunks if self.bm25_index is not None else []
         return {
             "documents": len({chunk.document_id for chunk in indexed_chunks}),
             "chunks": len(indexed_chunks),
             "vector_store": vector_store,
             "keyword_store": "bm25" if self.bm25_index is not None else "bm25-unavailable",
-            "embedding_model": self.embedding_provider.spec.model if provider_name != "local" else "not-configured",
+            # The local hash provider is a real, working provider; report its
+            # model instead of claiming the embedding is not configured.
+            "embedding_model": self.embedding_provider.spec.model,
             "embedding_version": self.embedding_provider.spec.version,
         }
 

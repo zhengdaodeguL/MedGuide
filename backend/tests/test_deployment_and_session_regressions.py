@@ -14,6 +14,7 @@ from app.safety import SafetyEngine
 from app.sql_guard import ReadOnlySQLGuard
 from app.store import SessionAuthorizationError, SessionStore
 from app.workflow import MedGuideWorkflow, WorkflowExecutionError
+from conftest import login_client
 
 
 def _workflow() -> MedGuideWorkflow:
@@ -33,8 +34,11 @@ def test_cors_defaults_to_same_origin_and_requires_explicit_allowlist(monkeypatc
         "https://admin.medguide.example",
     ]
 
+    # A wildcard must fail startup loudly instead of silently disabling
+    # CORS: an operator would otherwise believe cross-origin access is open.
     monkeypatch.setenv("MEDGUIDE_CORS_ORIGINS", "*")
-    assert main_module._cors_origins() == []
+    with pytest.raises(ValueError, match="must not contain"):
+        main_module._cors_origins()
 
 
 def test_production_requires_secure_cookie_and_https_pair(monkeypatch) -> None:
@@ -82,6 +86,7 @@ def test_production_api_rejects_http_even_with_untrusted_forwarded_proto(monkeyp
 
 def test_session_creation_is_idempotent_for_one_client_key() -> None:
     with TestClient(app) as client:
+        login_client(client, "deploy_idempotency_user")
         headers = {"Idempotency-Key": "session-browser-load-001"}
         first = client.post("/api/sessions", headers=headers)
         second = client.post("/api/sessions", headers=headers)
@@ -94,6 +99,7 @@ def test_session_creation_is_idempotent_for_one_client_key() -> None:
 
 def test_chat_request_id_replays_result_without_advancing_turn() -> None:
     with TestClient(app) as client:
+        login_client(client, "deploy_replay_user")
         session_id = client.post("/api/sessions").json()["session_id"]
         request = {
             "session_id": session_id,
@@ -113,6 +119,7 @@ def test_chat_request_id_replays_result_without_advancing_turn() -> None:
 
 def test_request_id_cannot_be_reused_for_different_message() -> None:
     with TestClient(app) as client:
+        login_client(client, "deploy_collision_user")
         session_id = client.post("/api/sessions").json()["session_id"]
         first = client.post(
             "/api/chat",
@@ -129,6 +136,7 @@ def test_request_id_cannot_be_reused_for_different_message() -> None:
 
 def test_duplicate_feedback_is_an_upsert_not_a_second_metric() -> None:
     with TestClient(app) as client:
+        login_client(client, "deploy_feedback_user")
         session_id = client.post("/api/sessions").json()["session_id"]
         answer = client.post(
             "/api/chat",

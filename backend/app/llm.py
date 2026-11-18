@@ -291,7 +291,7 @@ class OpenAIAnswerer:
         self.close()
 
 
-_COMPLETION_ENDPOINT_SUFFIXES = ("/chat/completions", "/chaat/completions")
+_COMPLETION_ENDPOINT_SUFFIXES = ("/chat/completions",)
 
 
 def _normalize_local_base_url(value: str) -> str:
@@ -332,11 +332,21 @@ def _normalize_base_url(value: str | None) -> str | None:
     if not raw:
         return None
     parsed = urlsplit(raw)
-    if not parsed.scheme or not parsed.netloc:
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise ValueError("OpenAI base URL must include an HTTP(S) host")
     path = parsed.path.rstrip("/")
     for suffix in _COMPLETION_ENDPOINT_SUFFIXES:
         if path.lower().endswith(suffix):
             path = path[: -len(suffix)].rstrip("/")
             break
-    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)).rstrip("/")
+    else:
+        # A path ending in some other ".../completions" is almost certainly
+        # a mistyped endpoint (e.g. "/chaat/completions"). Fail closed
+        # instead of silently truncating it to a base URL that then hits
+        # the wrong endpoint.
+        if path.lower().endswith("/completions"):
+            raise ValueError("OpenAI base URL looks like a mistyped completion endpoint")
+    # Query strings and fragments are never part of a base URL; drop them
+    # instead of forwarding them (and any credentials they carry) with
+    # every request.
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")

@@ -70,7 +70,15 @@ function containsNestedCredentials(value: string): boolean {
       return true;
     }
   }
-  const matches = decoded.normalize("NFKC").matchAll(/(?:^|[?&;\s])([^=&?#\s]+)\s*=/g);
+  const normalized = decoded.normalize("NFKC");
+  // A nested URL carrying userinfo (scheme://user:password@host) hides
+  // credentials that no key=value scan would ever see.
+  if (/:\/\/[^/\s]*@/.test(normalized)) {
+    return true;
+  }
+  // `#` and `/` are delimiters too: a credential smuggled in as
+  // `.../x%23token=secret` or `.../x/token=secret` must be caught.
+  const matches = normalized.matchAll(/(?:^|[?&;#/\s])([^=&?#\s]+)\s*=/g);
   return Array.from(matches).some((match) => isSensitiveQueryKey(match[1]));
 }
 

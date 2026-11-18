@@ -139,19 +139,25 @@ return 0
 
     _UPSERT_FEEDBACK_SCRIPT = """
 local previous = redis.call('HGET', KEYS[1], ARGV[1])
+local stored_comment = redis.call('HGET', KEYS[1], ARGV[1] .. ':commented')
+local comment_recorded = 0
+if ARGV[3] == '1' and stored_comment ~= ARGV[5] then
+    redis.call('HSET', KEYS[1], ARGV[1] .. ':commented', ARGV[5])
+    if not stored_comment then
+        redis.call('HINCRBY', KEYS[2], 'feedback_commented', 1)
+    end
+    comment_recorded = 1
+end
 if previous == ARGV[2] then
     redis.call('EXPIRE', KEYS[1], ARGV[4])
     redis.call('EXPIRE', KEYS[2], ARGV[4])
-    return 0
+    return comment_recorded
 end
 if previous == 'up' or previous == 'down' then
     redis.call('HINCRBY', KEYS[2], 'feedback_' .. previous, -1)
 end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
 redis.call('HINCRBY', KEYS[2], 'feedback_' .. ARGV[2], 1)
-if ARGV[3] == '1' and not previous then
-    redis.call('HINCRBY', KEYS[2], 'feedback_commented', 1)
-end
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 redis.call('EXPIRE', KEYS[2], ARGV[4])
 return 1
@@ -542,6 +548,12 @@ return 1
             if not callable(evaluator):
                 return None
             key = hashlib.sha256(f"{session_id}\x00{message_id}".encode("utf-8")).hexdigest()
+            # Only a hash of the comment reaches the metrics store, so a
+            # resubmitted rating with a new comment still counts as a change
+            # without storing user text in the metrics hash.
+            comment_hash = (
+                hashlib.sha256(comment.encode("utf-8")).hexdigest()[:16] if comment else ""
+            )
             changed = evaluator(
                 self._UPSERT_FEEDBACK_SCRIPT,
                 2,
@@ -551,6 +563,7 @@ return 1
                 rating,
                 "1" if comment else "0",
                 self.ttl_seconds,
+                comment_hash,
             )
             return bool(int(changed))
         except Exception as exc:

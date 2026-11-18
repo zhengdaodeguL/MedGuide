@@ -34,6 +34,10 @@ test("citation links reject credentials, private targets, and sensitive queries"
     "https://www.nhs.uk/reference?private_key=secret",
     "https://www.nhs.uk/reference?redirect=https%3A%2F%2Fother.test%2Fx%3Ftoken%3Dsecret",
     "https://www.nhs.uk/reference?redirect=https%253A%252F%252Fother.test%252Fx%253Fprivate_key%253Dsecret",
+    // Issue #8 6e: a credential smuggled in after a `#` fragment, or a
+    // nested URL carrying userinfo, must be caught as well.
+    "https://www.nhs.uk/?redirect=https://evil/x%23token=secret",
+    "https://www.nhs.uk/?redirect=https://user:secretpass@evil.example/",
   ]) {
     assert.equal(safeCitationSourceUrl(value), null, value);
   }

@@ -274,7 +274,9 @@ def test_local_generated_answer_keeps_citations_safety_and_runtime_identity(loca
     assert state["answer_source"] == "local-grounded" and state["citations"]
     assert not state["safety_blocked"]
     public = current.store.public(state)
-    assert public["environment"] == "local" and public["network_enabled"]
+    # Local mode is self-contained (local model, local knowledge, no remote
+    # services): it must not claim network access is enabled.
+    assert public["environment"] == "local" and public["network_enabled"] is False
     assert public["answer_source"] == "local-grounded"
     current.answerer.text = "你已经确诊肺炎，请立即停药。"
     reviewed = current.workflow.run({"session_id": "unsafe", "user_message": "咳嗽三天", "profile": {}})
