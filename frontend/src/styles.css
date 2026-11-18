@@ -139,6 +139,7 @@ button.starter-prompt:hover:not(:disabled) { border-color:#a1cbd0; background:#f
 .conversation-list { display:grid; gap:4px; }
 .conversation-item { display:flex; align-items:center; gap:8px; width:100%; padding:11px 8px; color:var(--ink-800); text-align:left; background:var(--teal-050); border:1px solid #d0e5e8; border-radius:7px; }
 .conversation-item:hover { background:#e8f3f5; }
+.conversation-item.active { background:#e8f3f5; border-color:#b6dadd; }
 .conversation-icon { display:grid; place-items:center; flex-shrink:0; width:24px; color:var(--teal-700); }
 .conversation-copy { display:grid; gap:5px; min-width:0; }
 .conversation-copy strong { overflow:hidden; font-size:12px; font-weight:500; text-overflow:ellipsis; white-space:nowrap; }

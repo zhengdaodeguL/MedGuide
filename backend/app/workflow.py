@@ -798,6 +798,46 @@ class MedGuideWorkflow:
                     return True
         return False
 
+    @staticmethod
+    def _append_turn_messages(state: WorkflowState) -> WorkflowState:
+        """Record this turn in the session transcript.
+
+        Runs after ``safety_review``, so the assistant entry holds the final
+        reviewed response. Idempotent replays never reach this node (the
+        caller returns the stored result first), and ``response_id`` guards
+        against a duplicate append if a turn were ever executed twice.
+        """
+        user_message = str(state.get("user_message") or state.get("normalized_message") or "").strip()
+        response = str(state.get("response", "") or "")
+        response_id = str(state.get("response_id") or "")
+        if not user_message and not response:
+            return state
+        messages = [
+            dict(item)
+            for item in state.get("messages", []) or []
+            if isinstance(item, dict)
+        ]
+        if response_id and any(
+            item.get("role") == "assistant" and item.get("response_id") == response_id
+            for item in messages
+        ):
+            return state
+        timestamp = datetime.now(timezone.utc).isoformat()
+        if user_message:
+            messages.append({"role": "user", "content": user_message, "timestamp": timestamp})
+        if response:
+            assistant: dict[str, Any] = {
+                "role": "assistant",
+                "content": response,
+                "timestamp": timestamp,
+            }
+            if response_id:
+                assistant["response_id"] = response_id
+            messages.append(assistant)
+        # Bound transcript growth the same way response_ids are bounded.
+        state["messages"] = messages[-100:]
+        return state
+
     def finalize(self, state: WorkflowState) -> WorkflowState:
         citations = state.get("citations", [])
         structured_result = state.get("structured_result")
@@ -822,6 +862,7 @@ class MedGuideWorkflow:
         if profile.get("history"):
             summary_parts.append("既往史：" + str(profile["history"]))
         state["summary"] = "；".join(summary_parts) if summary_parts else "已建立会话，等待补充症状和基础信息。"
+        self._append_turn_messages(state)
         # The runner writes its actual engine after the node loop completes.
         state.setdefault("workflow_engine", "deterministic")
         return state

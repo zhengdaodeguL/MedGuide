@@ -53,6 +53,13 @@ type Citation = {
   source_url?: string;
 };
 
+type StoredMessage = {
+  role: "user" | "assistant";
+  content: string;
+  response_id?: string;
+  timestamp?: string;
+};
+
 type SessionState = {
   session_id: string;
   turn_count: number;
@@ -62,6 +69,8 @@ type SessionState = {
   intent: string;
   next_question: string | null;
   mode: string;
+  /** Full turn transcript, oldest first; absent on older API versions. */
+  messages?: StoredMessage[];
   /** Optional capability fields supplied by newer API versions. */
   environment?: string;
   network_enabled?: boolean;
@@ -71,6 +80,15 @@ type SessionState = {
   workflow_path?: string[];
   workflow_skipped_nodes?: string[];
   summary?: string;
+};
+
+type SessionListItem = {
+  session_id: string;
+  title: string;
+  summary: string;
+  turn_count: number;
+  updated_at: string | null;
+  risk_level?: RiskLevel | null;
 };
 
 type StructuredResult = {
@@ -246,6 +264,7 @@ function App() {
   const [authBootstrapError, setAuthBootstrapError] = useState<string | null>(null);
   const [logoutPending, setLogoutPending] = useState(false);
   const [session, setSession] = useState<SessionState | null>(null);
+  const [sessions, setSessions] = useState<SessionListItem[]>([]);
   const [messages, setMessages] = useState<Message[]>([initialMessage]);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(false);
@@ -403,6 +422,7 @@ function App() {
     committedResponseIdsRef.current.clear();
     sessionCreateKeyRef.current = null;
     setSession(null);
+    setSessions([]);
     setSessionStatus("idle");
     setMessages([{ ...initialMessage, timestamp: Date.now() }]);
     setDraft("");
@@ -436,7 +456,117 @@ function App() {
     setAuthBootstrapError(null);
     const createKey = createRequestId("session");
     sessionCreateKeyRef.current = createKey;
-    startSession(createKey);
+    void loadSessionHistory();
+  }
+
+  /** Best-effort refresh of the left-rail history list; never blocks chat. */
+  async function refreshSessionList() {
+    try {
+      const response = await apiFetch("/api/sessions");
+      if (!response.ok) return;
+      const body = (await response.json()) as { sessions?: SessionListItem[] };
+      if (Array.isArray(body.sessions)) setSessions(body.sessions);
+    } catch {
+      // History is a convenience view; a failed refresh must not surface
+      // as a chat error.
+    }
+  }
+
+  /**
+   * On login/refresh, restore the newest session that already has messages
+   * instead of opening an empty one. A fresh session is created only when
+   * the user has no history yet. The list endpoint — not localStorage —
+   * is the source of truth for which sessions exist.
+   */
+  async function loadSessionHistory() {
+    const generation = generationRef.current;
+    setSessionStatus("creating");
+    try {
+      const response = await apiFetch("/api/sessions");
+      await ensureResponseOk(response);
+      const body = (await response.json()) as { sessions?: SessionListItem[] };
+      const listed = Array.isArray(body.sessions) ? body.sessions : [];
+      if (generationRef.current !== generation) return;
+      setSessions(listed);
+      const latest = listed.find((item) => item.turn_count > 0);
+      if (latest) {
+        await restoreSession(latest.session_id);
+        return;
+      }
+    } catch (requestError) {
+      if (generationRef.current !== generation) return;
+      if (requestError instanceof HttpResponseError && requestError.status === 401) {
+        returnToAuthentication("登录状态已过期，请重新登录。");
+        return;
+      }
+      // Fall through to a fresh session when history cannot be read.
+    }
+    startSession(sessionCreateKeyRef.current || createRequestId("session"));
+  }
+
+  function applyRestoredSession(state: SessionState) {
+    activeSessionIdRef.current = state.session_id;
+    committedResponseIdsRef.current.clear();
+    const restored: Message[] = [{ ...initialMessage, timestamp: Date.now() }];
+    for (const [index, item] of (state.messages || []).entries()) {
+      const parsed = item.timestamp ? Date.parse(item.timestamp) : Number.NaN;
+      const message: Message = {
+        id: item.response_id || `restored-${index}`,
+        role: item.role,
+        content: item.content,
+        timestamp: Number.isNaN(parsed) ? Date.now() : parsed,
+        sessionId: state.session_id,
+      };
+      if (item.role === "assistant" && item.response_id) {
+        committedResponseIdsRef.current.add(item.response_id);
+      }
+      restored.push(message);
+    }
+    setSession(state);
+    setMessages(restored);
+    // Per-message citations are not stored server-side, so restored
+    // answers link no references; the live turn's citations still apply.
+    setCitations([]);
+    setSelectedCitationMessageId(null);
+    setStructuredResult(null);
+    setEvents([]);
+    setFeedbackSent({});
+    setFeedbackPending({});
+  }
+
+  async function restoreSession(sessionId: string) {
+    const generation = ++generationRef.current;
+    sessionRequestRef.current?.abort();
+    chatRequestRef.current?.abort();
+    chatRequestRef.current = null;
+    pendingRetryRef.current = null;
+    setSessionStatus("creating");
+    setLoading(false);
+    setError(null);
+    const controller = new AbortController();
+    sessionRequestRef.current = controller;
+    try {
+      const response = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+        signal: controller.signal,
+      });
+      await ensureResponseOk(response);
+      const body = (await response.json()) as SessionState;
+      if (!body.session_id || !requestIsCurrent(generation, controller)) return;
+      applyRestoredSession(body);
+      setSessionStatus("ready");
+    } catch (requestError) {
+      if (isAbortError(requestError) || !requestIsCurrent(generation, controller)) return;
+      if (requestError instanceof HttpResponseError && requestError.status === 401) {
+        returnToAuthentication("登录状态已过期，请重新登录。");
+        return;
+      }
+      activeSessionIdRef.current = null;
+      setSession(null);
+      setSessionStatus("error");
+      setError(requestError instanceof HttpResponseError ? formatHttpError(requestError) : "整理服务暂不可用，请稍后重试。");
+    } finally {
+      if (sessionRequestRef.current === controller) sessionRequestRef.current = null;
+    }
   }
 
   function restoreAuthentication() {
@@ -578,6 +708,7 @@ function App() {
         activeSessionIdRef.current = body.state.session_id;
         setSession(body.state);
         setSessionStatus("ready");
+        void refreshSessionList();
       } catch (requestError) {
         if (isAbortError(requestError) || !requestIsCurrent(generation, controller)) return;
         if (requestError instanceof HttpResponseError && requestError.status === 401) {
@@ -773,6 +904,8 @@ function App() {
       latency: body.latency_ms,
       sessionId: body.state.session_id,
     });
+    // The turn changed this session's title and turn count in the history.
+    void refreshSessionList();
   }
 
   function newConversation() {
@@ -922,12 +1055,25 @@ function App() {
             </div>
           </div>
           <button className="new-session-button" onClick={newConversation}><Plus size={18} />开启新对话<ArrowUpRight size={16} /></button>
-          <div className="rail-section-label"><MessageCircle size={14} />这次对话</div>
+          <div className="rail-section-label"><MessageCircle size={14} />历史对话</div>
           <div className="conversation-list">
-            <button className="conversation-item active" onClick={closeMobilePanel}>
-              <span className="conversation-icon"><MessageCircle size={16} /></span>
-              <span className="conversation-copy"><strong>{messages.find((message) => message.role === "user")?.content || "新的健康咨询"}</strong><span>{messages.length > 1 ? `${messages.length - 1} 条消息` : "尚未开始"}</span></span>
-            </button>
+            {sessions.length === 0 ? (
+              <button className="conversation-item active" onClick={closeMobilePanel}>
+                <span className="conversation-icon"><MessageCircle size={16} /></span>
+                <span className="conversation-copy"><strong>{messages.find((message) => message.role === "user")?.content || "新的健康咨询"}</strong><span>{messages.length > 1 ? `${messages.length - 1} 条消息` : "尚未开始"}</span></span>
+              </button>
+            ) : (
+              sessions.map((item) => (
+                <button
+                  key={item.session_id}
+                  className={`conversation-item${session?.session_id === item.session_id ? " active" : ""}`}
+                  onClick={() => { void restoreSession(item.session_id); closeMobilePanel(); }}
+                >
+                  <span className="conversation-icon"><MessageCircle size={16} /></span>
+                  <span className="conversation-copy"><strong>{item.title}</strong><span>{item.turn_count > 0 ? `${item.turn_count} 轮整理` : "尚未开始"}</span></span>
+                </button>
+              ))
+            )}
           </div>
           <div className="rail-guide">
             <span className="eyebrow">如何描述问题</span>
