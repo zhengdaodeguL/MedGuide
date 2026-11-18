@@ -148,6 +148,117 @@ def test_docker_context_excludes_local_dependencies_and_runtime_artifacts() -> N
     assert ".env.*" in dockerignore and "!.env.template" in dockerignore
 
 
+def _run_api_entrypoint(environment: dict[str, str], tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run the real API entrypoint with a controlled environment.
+
+    The command under test is ``true`` so a successful run proves the
+    pre-flight checks passed; the knowledge backend is ``disabled`` in
+    passing cases so the run never reaches the ingestion/index branches
+    that need a container filesystem and network. The environment is
+    built from scratch so ambient developer variables cannot mask a
+    missing-dependency case.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    python_link = bin_dir / "python"
+    if not python_link.exists():
+        python_link.symlink_to(sys.executable)
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "MEDGUIDE_MODE": "production",
+        "MEDGUIDE_NETWORK_SUBNET": "172.30.0.0/16",
+        "MEDGUIDE_API_TRUSTED_PROXY_CIDR": "172.30.0.0/16",
+        "BM25_INDEX_PATH": str(tmp_path / "bm25-index.json"),
+        "MEDGUIDE_KNOWLEDGE_BACKEND": "disabled",
+    }
+    env.update(environment)
+    return subprocess.run(
+        ["sh", str(ROOT / "backend" / "docker-entrypoint.sh"), "true"],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+
+
+_PRODUCTION_DEPENDENCIES = {
+    "OPENAI_API_KEY": "test-key",
+    "OPENAI_MODEL": "test-model",
+    "REDIS_URL": "redis://127.0.0.1:6379/0",
+    "MEDGUIDE_AUTH_DSN": "mysql://user:pass@127.0.0.1:3306/medguide",
+    "MILVUS_URI": "http://127.0.0.1:19530",
+}
+
+
+def test_production_entrypoint_fails_fast_on_missing_dependencies(tmp_path: Path) -> None:
+    """Issue #20: a missing production dependency must fail at startup,
+    naming the variable, instead of leaving the stack permanently
+    unhealthy behind a 503 /api/ready."""
+    entrypoint = (ROOT / "backend" / "docker-entrypoint.sh").read_text(encoding="utf-8")
+    assert "MedGuide production deployment is missing required configuration" in entrypoint
+    assert 'if backend == "milvus"' in entrypoint
+    assert "MEDGUIDE_ALLOW_SQLITE_AUTH" in entrypoint
+
+    for variable in ("OPENAI_API_KEY", "OPENAI_MODEL", "REDIS_URL", "MEDGUIDE_AUTH_DSN"):
+        environment = dict(_PRODUCTION_DEPENDENCIES)
+        del environment[variable]
+        completed = _run_api_entrypoint(environment, tmp_path)
+        assert completed.returncode != 0
+        assert variable in completed.stderr
+        assert "Set the missing variables in .env" in completed.stderr
+
+
+def test_production_entrypoint_requires_milvus_uri_only_for_milvus_backend(tmp_path: Path) -> None:
+    environment = dict(_PRODUCTION_DEPENDENCIES)
+    del environment["MILVUS_URI"]
+    environment["MEDGUIDE_KNOWLEDGE_BACKEND"] = "milvus"
+    completed = _run_api_entrypoint(environment, tmp_path)
+    assert completed.returncode != 0
+    assert "MILVUS_URI" in completed.stderr
+
+    # A non-milvus backend must not demand MILVUS_URI: the disabled backend
+    # reaches `exec "$@"` here, which proves the check passed.
+    environment["MEDGUIDE_KNOWLEDGE_BACKEND"] = "disabled"
+    completed = _run_api_entrypoint(environment, tmp_path)
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+
+
+def test_production_entrypoint_accepts_explicit_sqlite_auth(tmp_path: Path) -> None:
+    environment = dict(_PRODUCTION_DEPENDENCIES)
+    del environment["MEDGUIDE_AUTH_DSN"]
+    completed = _run_api_entrypoint(environment, tmp_path)
+    assert completed.returncode != 0
+    assert "MEDGUIDE_AUTH_DSN" in completed.stderr
+
+    environment["MEDGUIDE_AUTH_BACKEND"] = "sqlite"
+    environment["MEDGUIDE_ALLOW_SQLITE_AUTH"] = "true"
+    completed = _run_api_entrypoint(environment, tmp_path)
+    assert completed.returncode == 0
+
+    # Opting into SQLite auth needs the explicit flag; the backend alone
+    # is not enough.
+    del environment["MEDGUIDE_ALLOW_SQLITE_AUTH"]
+    completed = _run_api_entrypoint(environment, tmp_path)
+    assert completed.returncode != 0
+    assert "MEDGUIDE_AUTH_DSN" in completed.stderr
+
+
+def test_production_entrypoint_passes_when_dependencies_are_set(tmp_path: Path) -> None:
+    completed = _run_api_entrypoint(dict(_PRODUCTION_DEPENDENCIES), tmp_path)
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+
+    # The check is production-only: test mode with nothing configured
+    # must reach the command instead of failing on production variables.
+    completed = _run_api_entrypoint(
+        {"MEDGUIDE_MODE": "test", "MEDGUIDE_KNOWLEDGE_BACKEND": "disabled"},
+        tmp_path,
+    )
+    assert completed.returncode == 0
+
+
 def test_browser_deployment_is_same_origin_and_cookie_authenticated() -> None:
     app = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
     index = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
@@ -222,3 +333,52 @@ def test_browser_deployment_is_same_origin_and_cookie_authenticated() -> None:
     assert 'header Strict-Transport-Security' in gateway
     assert 'MEDGUIDE_DOMAIN is required' in gateway_entrypoint
     assert "ports:" not in compose.split("medguide-gateway:", 1)[0]
+
+
+def _compose_service_block(compose: str, name: str) -> str:
+    """The text of one service block in a compose file (no yaml needed).
+
+    Services are the two-space-indented keys under ``services:``; the
+    block runs until the next service or the next top-level key.
+    """
+    start = compose.index(f"  {name}:")
+    rest = compose[start + len(f"  {name}:") :]
+    lines = rest.splitlines(keepends=True)
+    block = []
+    for line in lines:
+        if not line.strip():
+            block.append(line)
+            continue
+        # A sibling service header (exactly two spaces) or a top-level key
+        # (column 0) ends the block; anything deeper indented belongs to it.
+        indent = len(line) - len(line.lstrip(" "))
+        if indent in (0, 2) and not line.startswith("\t"):
+            break
+        block.append(line)
+    return "".join(block)
+
+
+def test_main_compose_services_restart_and_have_memory_limits() -> None:
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    # Top-level restart/mem_limit are the keys plain `docker compose up`
+    # honours; deploy.restart_policy / deploy.resources are swarm-only and
+    # silently ignored here, so the main compose must not contain a deploy
+    # block at all (issue #29).
+    assert "deploy:" not in compose
+    assert compose.count("restart: unless-stopped") == 3
+    assert compose.count("mem_limit: 1g") == 1
+    assert compose.count("mem_limit: 128m") == 2
+    assert _compose_service_block(compose, "medguide-api").count("restart: unless-stopped") == 1
+    assert "mem_limit: 1g" in _compose_service_block(compose, "medguide-api")
+    assert "mem_limit: 128m" in _compose_service_block(compose, "medguide-ui")
+    assert "mem_limit: 128m" in _compose_service_block(compose, "medguide-gateway")
+
+
+def test_demo_and_local_composes_keep_the_same_restart_and_limits() -> None:
+    for relative in ("deploy/instabox/compose.demo.yml", "deploy/instabox/compose.local.yml"):
+        compose = (ROOT / relative).read_text(encoding="utf-8")
+        assert "deploy:" not in compose
+        assert "restart: unless-stopped" in _compose_service_block(compose, "medguide-api")
+        assert "mem_limit: 1g" in _compose_service_block(compose, "medguide-api")
+        assert "restart: unless-stopped" in _compose_service_block(compose, "medguide-ui")
+        assert "mem_limit: 128m" in _compose_service_block(compose, "medguide-ui")

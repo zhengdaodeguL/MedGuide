@@ -33,6 +33,12 @@ class OpenAIAnswerer:
         mode = os.getenv("MEDGUIDE_MODE", "production").strip().lower()
         self.local = mode == "local"
         self.required = mode not in {"offline", "test"}
+        # The local reasoning toggle is provider-specific: llama.cpp honours
+        # chat_template_kwargs.enable_thinking=false, while Ollama ignores
+        # it and needs reasoning_effort="none" (issue #1). An unknown
+        # provider fails closed at startup instead of silently sending the
+        # wrong toggle to the local model.
+        self.local_llm_provider = self._read_local_provider() if self.local else None
         configured_model = (
             os.getenv("MEDGUIDE_LOCAL_LLM_MODEL", "")
             if self.local else (model if model is not None else os.getenv("OPENAI_MODEL", ""))
@@ -193,6 +199,13 @@ class OpenAIAnswerer:
             return 1600
 
     @staticmethod
+    def _read_local_provider() -> str:
+        provider = os.getenv("MEDGUIDE_LOCAL_LLM_PROVIDER", "llama.cpp").strip().lower()
+        if provider not in {"llama.cpp", "ollama"}:
+            raise ValueError("MEDGUIDE_LOCAL_LLM_PROVIDER must be llama.cpp or ollama")
+        return provider
+
+    @staticmethod
     def _read_local_timeout() -> float:
         try:
             value = float(os.getenv("MEDGUIDE_LOCAL_LLM_TIMEOUT_SECONDS", "120"))
@@ -208,10 +221,15 @@ class OpenAIAnswerer:
             return 512
 
     def _local_request_options(self) -> dict[str, Any]:
-        return (
-            {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-            if getattr(self, "local", False) else {}
-        )
+        if not getattr(self, "local", False):
+            return {}
+        # Shared by the readiness probe and generate, so one provider
+        # choice covers both. Ollama ignores llama.cpp's thinking toggle
+        # and spends the probe budget on reasoning instead, leaving an
+        # empty message body (issue #1).
+        if getattr(self, "local_llm_provider", "llama.cpp") == "ollama":
+            return {"extra_body": {"reasoning_effort": "none"}}
+        return {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
 
     def generate(self, query: str, risk: str, context: str) -> str | None:
         if not self.ensure_ready():
@@ -291,7 +309,7 @@ class OpenAIAnswerer:
         self.close()
 
 
-_COMPLETION_ENDPOINT_SUFFIXES = ("/chat/completions", "/chaat/completions")
+_COMPLETION_ENDPOINT_SUFFIXES = ("/chat/completions",)
 
 
 def _normalize_local_base_url(value: str) -> str:
@@ -332,11 +350,21 @@ def _normalize_base_url(value: str | None) -> str | None:
     if not raw:
         return None
     parsed = urlsplit(raw)
-    if not parsed.scheme or not parsed.netloc:
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise ValueError("OpenAI base URL must include an HTTP(S) host")
     path = parsed.path.rstrip("/")
     for suffix in _COMPLETION_ENDPOINT_SUFFIXES:
         if path.lower().endswith(suffix):
             path = path[: -len(suffix)].rstrip("/")
             break
-    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)).rstrip("/")
+    else:
+        # A path ending in some other ".../completions" is almost certainly
+        # a mistyped endpoint (e.g. "/chaat/completions"). Fail closed
+        # instead of silently truncating it to a base URL that then hits
+        # the wrong endpoint.
+        if path.lower().endswith("/completions"):
+            raise ValueError("OpenAI base URL looks like a mistyped completion endpoint")
+    # Query strings and fragments are never part of a base URL; drop them
+    # instead of forwarding them (and any credentials they carry) with
+    # every request.
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")

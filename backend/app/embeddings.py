@@ -289,7 +289,7 @@ def _embedding_timeout() -> float:
         return 15.0
 
 
-_EMBEDDING_ENDPOINT_SUFFIXES = ("/embeddings", "/chat/completions", "/chaat/completions")
+_EMBEDDING_ENDPOINT_SUFFIXES = ("/embeddings", "/chat/completions")
 
 
 def _normalize_embedding_base_url(value: str | None) -> str | None:
@@ -299,11 +299,19 @@ def _normalize_embedding_base_url(value: str | None) -> str | None:
     if not raw:
         return None
     parsed = urlsplit(raw)
-    if not parsed.scheme or not parsed.netloc:
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise ValueError("Embedding base URL must include an HTTP(S) host")
     path = parsed.path.rstrip("/")
     for suffix in _EMBEDDING_ENDPOINT_SUFFIXES:
         if path.lower().endswith(suffix):
             path = path[: -len(suffix)].rstrip("/")
             break
-    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)).rstrip("/")
+    else:
+        # See _normalize_base_url: a mistyped endpoint must fail closed
+        # instead of being silently truncated to a wrong base URL.
+        if path.lower().endswith("/completions"):
+            raise ValueError("Embedding base URL looks like a mistyped completion endpoint")
+    # Query strings and fragments are never part of a base URL; drop them
+    # instead of forwarding them (and any credentials they carry) with
+    # every request.
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")

@@ -26,7 +26,7 @@ MedGuide 是面向健康信息整理与就医指引的可审计服务。系统�
 Copy-Item .env.template .env
 ```
 
-生产模式至少填写 `MEDGUIDE_DOMAIN`、`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`、`REDIS_URL` 和 `MEDGUIDE_AUTH_DSN`。`MEDGUIDE_DOMAIN` 必须是已经解析到部署主机的公网域名；内置 Caddy 网关会自动申请并续期 TLS 证书。知识后端默认是 `milvus`，此时还必须填写 `MILVUS_URI`；若只使用经过审核并生成索引的词法知识库，请将 `MEDGUIDE_KNOWLEDGE_BACKEND` 明确设为 `bm25`。供应商地址填写到 `/v1` 基础路径，SDK 会调用标准 `/v1/chat/completions`：
+生产模式至少填写 `MEDGUIDE_DOMAIN`、`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`、`REDIS_URL` 和 `MEDGUIDE_AUTH_DSN`。`MEDGUIDE_DOMAIN` 必须是已经解析到部署主机的公网域名；内置 Caddy 网关会自动申请并续期 TLS 证书。知识后端默认是 `milvus`，此时还必须填写 `MILVUS_URI`；若只使用经过审核并生成索引的词法知识库，请将 `MEDGUIDE_KNOWLEDGE_BACKEND` 明确设为 `bm25`。API 容器在启动前会校验生产必填依赖（`OPENAI_API_KEY`、`OPENAI_MODEL`、`REDIS_URL`、`MEDGUIDE_AUTH_DSN`，`milvus` 后端时还有 `MILVUS_URI`），缺失时直接报错退出并指明缺了哪一项；按提示补齐 `.env` 后重新 `docker compose up --build -d`。供应商地址填写到 `/v1` 基础路径，SDK 会调用标准 `/v1/chat/completions`：
 
 ```text
 OPENAI_BASE_URL=<OpenAI-compatible API base URL>
@@ -62,6 +62,7 @@ API 容器会在进程启动前按知识后端准备索引。`bm25` 模式根据
 | --- | --- |
 | `MEDGUIDE_MODE` | 外部模型与共享存储设为 `production`；单实例本地推理使用独立 `local` 配置 |
 | `MEDGUIDE_LOCAL_LLM_BASE_URL` / `MEDGUIDE_LOCAL_LLM_MODEL` | `local` 模式专用的本机模型地址和模型 ID，不继承 `OPENAI_*` |
+| `MEDGUIDE_LOCAL_LLM_PROVIDER` | 本地推理服务类型：`llama.cpp`（默认，发送 `chat_template_kwargs.enable_thinking=false`）或 `ollama`（发送 `reasoning_effort=none`）；非法值启动即报错 |
 | `MEDGUIDE_LOCAL_LLM_TIMEOUT_SECONDS` / `MEDGUIDE_LOCAL_LLM_MAX_TOKENS` | 本地生成预算，默认 120 秒 / 512 token |
 | `MEDGUIDE_DOMAIN` | 已解析到部署主机的公网域名；TLS 网关启动时校验，缺失或非法则失败关闭 |
 | `MEDGUIDE_HTTP_PORT` / `MEDGUIDE_HTTPS_PORT` | TLS 网关对外发布端口，默认 80/443 |
