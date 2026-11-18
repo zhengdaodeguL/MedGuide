@@ -35,6 +35,10 @@ class InvalidCredentialsError(AuthError):
     """Raised for an unknown username or an incorrect password."""
 
 
+class UnknownUserError(AuthError):
+    """Raised when a session is requested for a username that is not registered."""
+
+
 class InvalidUsernameError(AuthError):
     """Raised when a username cannot be represented safely."""
 
@@ -323,6 +327,16 @@ class AuthStore:
 
     def create_session(self, username: str) -> tuple[str, int]:
         normalized = normalize_username(username)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM users WHERE username = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            # Check first so a missing user is reported as such, instead of
+            # surfacing as a foreign-key IntegrityError retried as a
+            # "could not allocate a unique authentication token" failure.
+            raise UnknownUserError("user does not exist")
         now = int(self._clock())
         expires_at = now + self.session_ttl_seconds
         for _ in range(3):
@@ -338,7 +352,13 @@ class AuthStore:
                         (self._token_hash(token), normalized, now, expires_at),
                     )
                 return token, expires_at
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
+                # Only a token-hash collision is worth retrying; any other
+                # constraint failure (e.g. a foreign key, if the user was
+                # deleted between the check above and the insert) must
+                # surface immediately instead of being misreported.
+                if not _is_unique_constraint_error(exc):
+                    raise
                 continue
         raise RuntimeError("could not allocate a unique authentication token")
 
@@ -593,6 +613,16 @@ class MySQLAuthStore:
         from sqlalchemy.exc import IntegrityError
 
         normalized = normalize_username(username)
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                text("SELECT 1 FROM medguide_users WHERE username = :username"),
+                {"username": normalized},
+            ).first()
+        if row is None:
+            # Check first so a missing user is reported as such, instead of
+            # surfacing as a foreign-key IntegrityError retried as a
+            # "could not allocate a unique authentication token" failure.
+            raise UnknownUserError("user does not exist")
         now = int(self._clock())
         expires_at = now + self.session_ttl_seconds
         for _ in range(3):
@@ -617,7 +647,13 @@ class MySQLAuthStore:
                         },
                     )
                 return token, expires_at
-            except IntegrityError:
+            except IntegrityError as exc:
+                # Only a token-hash collision is worth retrying; any other
+                # constraint failure (e.g. a foreign key, if the user was
+                # deleted between the check above and the insert) must
+                # surface immediately instead of being misreported.
+                if not _is_unique_constraint_error(exc):
+                    raise
                 continue
         raise RuntimeError("could not allocate a unique authentication token")
 

@@ -45,13 +45,18 @@ export function buildWorkflowStages(
   return STAGES.map((stage) => {
     const terminal = stage.nodes.every((node) => byNode.has(node));
     const skipped = terminal && stage.nodes.every((node) => byNode.get(node)?.status === "skipped");
+    // Once the run has ended, a stage that never completed did not stay
+    // "pending": it was not executed.  Only a live run has a pending stage.
     const status = terminal ? (skipped ? "skipped" : "completed")
-      : loading && !activeAssigned ? "running" : "pending";
+      : loading && !activeAssigned ? "running"
+      : loading ? "pending" : "skipped";
     if (!terminal) activeAssigned = true;
     const label = stage.id === "answer" && risk === "high" ? "整理紧急就医指引"
       : stage.id === "answer" && intent === "structured" ? "核对只读查询结果" : stage.label;
     const skippedRetrieval = byNode.get("retrieve")?.status === "skipped";
-    const detail = stage.id === "answer" && skippedRetrieval
+    // The "skipped retrieval" note describes a finished answer stage; it
+    // must not appear while the answer stage is still running or pending.
+    const detail = terminal && stage.id === "answer" && skippedRetrieval
       ? risk === "high" ? "高风险分流，跳过普通资料检索" : "结构化分支，跳过普通资料检索"
       : undefined;
     return { id: stage.id, label, status, detail };

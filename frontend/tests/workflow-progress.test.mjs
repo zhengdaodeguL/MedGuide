@@ -39,3 +39,31 @@ test("final JSON and recovered replies restore node states from metadata", () =>
   assert.ok(buildWorkflowStages(restored, "low", "disease", false).every((stage) => stage.status === "completed"));
   assert.deepEqual(responsePipelineEvents([event("risk")], metadata), [event("risk")]);
 });
+
+test("a run that ends unfinished marks unexecuted stages skipped, not pending", () => {
+  const events = [event("normalize"), event("extract_profile"), event("intent")];
+  const stages = buildWorkflowStages(events, "low", "disease", false);
+  assert.equal(stages[0].status, "completed");
+  assert.equal(stages[1].status, "skipped");
+  assert.equal(stages[2].status, "skipped");
+  assert.equal(stages[3].status, "skipped");
+  // While the same run is still live, the next stage is running.
+  const live = buildWorkflowStages(events, "low", "disease", true);
+  assert.equal(live[1].status, "running");
+  assert.equal(live[2].status, "pending");
+});
+
+test("the skipped-retrieval note only appears once the answer stage is finished", () => {
+  const events = [event("normalize"), event("extract_profile"), event("intent"), event("risk"), event("retrieve", "skipped")];
+  const running = buildWorkflowStages(events, "high", "disease", true);
+  assert.equal(running[2].status, "running");
+  assert.equal(running[2].detail, undefined);
+  const finished = buildWorkflowStages(
+    [...events, event("structured_query", "skipped"), event("draft"), event("safety_review"), event("finalize")],
+    "high",
+    "disease",
+    false,
+  );
+  assert.equal(finished[2].status, "completed");
+  assert.match(finished[2].detail, /跳过普通资料检索/);
+});

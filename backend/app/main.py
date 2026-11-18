@@ -489,9 +489,13 @@ def _cors_origins() -> list[str]:
     origins = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
     # Credentials and wildcard origins are mutually exclusive.  Treat a
     # wildcard as an explicit configuration error rather than silently
-    # downgrading browser security.
+    # downgrading browser security: failing startup is the only honest
+    # signal, otherwise an operator would believe CORS is open.
     if "*" in origins:
-        return []
+        raise ValueError(
+            "MEDGUIDE_CORS_ORIGINS must not contain '*': wildcard origins cannot "
+            "be combined with credentials; list explicit origins instead."
+        )
     return origins
 
 
@@ -565,9 +569,13 @@ def _require_access(
     # A proxy-validated cookie can expire or be revoked before this handler.
     # Cookie-bearing offline requests must not fall back to anonymous access;
     # production service-header priority remains unchanged.
-    if principal is None and (
-        getattr(current, "production", False) or getattr(current, "local", False) or session_token is not None
-    ):
+    # Issue #6: authentication is required in every mode. Test/offline used
+    # to let requests without any credential through (while rejecting an
+    # invalid cookie), which exposed protected APIs and other users'
+    # sessions anonymously. There is intentionally no anonymous fallback
+    # switch: /api/health and /api/ready stay public for probes, and every
+    # other caller must present a valid session cookie or service token.
+    if principal is None:
         raise HTTPException(status_code=401, detail="请先登录")
     _require_runtime(current)
     return principal
@@ -580,11 +588,19 @@ def _require_service_access(
     api_key: str | None = None,
 ) -> str | None:
     _require_secure_transport(current, request)
-    if not current.production:
-        return None
-    principal = _principal_from_headers(current, authorization, api_key)
-    _require_runtime(current)
-    return principal
+    if current.production:
+        principal = _principal_from_headers(current, authorization, api_key)
+        _require_runtime(current)
+        return principal
+    # Issue #6: the operator endpoint was wide open outside production
+    # (this function returned before any check). No service API tokens are
+    # configured in test/offline/local modes, so a logged-in user session is
+    # the credential here; anonymous access is never allowed. Production
+    # keeps the stricter service-token-only rule.
+    username = _username_from_cookie(current, _session_token_from_request(current, request))
+    if username is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+    return f"user:{username}"
 
 
 def _message_fingerprint(message: str) -> str:
@@ -1020,6 +1036,34 @@ def create_session(
     except SessionBackendError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return SessionCreateResponse(session_id=state["session_id"], state=public_state(state))
+
+
+@app.get("/api/sessions")
+def list_sessions(
+    http_request: Request,
+    authorization: str | None = Header(default=None),
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
+    # Registered before /api/sessions/{session_id} so "sessions" is never
+    # treated as a session id.
+    current = get_services()
+    owner_id = _require_access(
+        current,
+        http_request,
+        authorization,
+        api_key,
+        _session_token_from_request(current, http_request),
+    )
+    try:
+        sessions = current.store.list_sessions(owner_id)
+    except SessionBackendError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "sessions": sessions,
+        # False when the shared backend cannot enumerate sessions; the list
+        # is then empty on purpose rather than partial. See store.py.
+        "complete": current.store.listing_complete,
+    }
 
 
 @app.get("/api/sessions/{session_id}")
