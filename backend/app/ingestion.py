@@ -230,7 +230,13 @@ class MedicalDocumentCleaner:
                 break
             decoded = next_value
         normalized = unicodedata.normalize("NFKC", decoded)
-        for match in re.finditer(r"(?:^|[?&;\s])([^=&?#\s]+)\s*=", normalized):
+        # A nested URL carrying userinfo (scheme://user:password@host)
+        # hides credentials that no key=value scan would ever see.
+        if re.search(r"://[^/\s]*@", normalized):
+            return True
+        # `#` and `/` are delimiters too: a credential smuggled in as
+        # `.../x%23token=secret` or `.../x/token=secret` must be caught.
+        for match in re.finditer(r"(?:^|[?&;#/\s])([^=&?#\s]+)\s*=", normalized):
             if cls._sensitive_query_key(match.group(1)):
                 return True
         return False
