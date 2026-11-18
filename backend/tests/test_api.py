@@ -2,10 +2,12 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.main import AppServices, app
+from conftest import login_client
 
 
 def test_session_chat_and_search_api() -> None:
     with TestClient(app, base_url="https://testserver") as client:
+        login_client(client, "api_test_user")
         created = client.post("/api/sessions")
         assert created.status_code == 200
         session_id = created.json()["session_id"]
@@ -37,6 +39,7 @@ def test_session_chat_and_search_api() -> None:
 
 def test_sse_chat_has_node_and_final_events() -> None:
     with TestClient(app) as client:
+        login_client(client, "api_sse_user")
         response = client.post("/api/chat?stream=true", json={"message": "查布洛芬库存"})
         assert response.status_code == 200
         assert "event: node" in response.text
@@ -108,6 +111,7 @@ def test_missing_mode_defaults_to_fail_closed_production(tmp_path, monkeypatch) 
 
 def test_api_responses_disable_shared_caching() -> None:
     with TestClient(app) as client:
+        login_client(client, "api_cache_user")
         response = client.post("/api/sessions")
         assert response.headers["cache-control"] == "no-store, private"
         assert response.headers["pragma"] == "no-cache"
