@@ -1022,6 +1022,34 @@ def create_session(
     return SessionCreateResponse(session_id=state["session_id"], state=public_state(state))
 
 
+@app.get("/api/sessions")
+def list_sessions(
+    http_request: Request,
+    authorization: str | None = Header(default=None),
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
+    # Registered before /api/sessions/{session_id} so "sessions" is never
+    # treated as a session id.
+    current = get_services()
+    owner_id = _require_access(
+        current,
+        http_request,
+        authorization,
+        api_key,
+        _session_token_from_request(current, http_request),
+    )
+    try:
+        sessions = current.store.list_sessions(owner_id)
+    except SessionBackendError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "sessions": sessions,
+        # False when the shared backend cannot enumerate sessions; the list
+        # is then empty on purpose rather than partial. See store.py.
+        "complete": current.store.listing_complete,
+    }
+
+
 @app.get("/api/sessions/{session_id}")
 def get_session(
     session_id: str,

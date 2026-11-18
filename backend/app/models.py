@@ -12,6 +12,7 @@ class PatientProfile(TypedDict, total=False):
     age: int
     sex: str
     duration: str
+    temperature: str
     symptoms: list[str]
     associated_symptoms: list[str]
     history: str
@@ -24,6 +25,11 @@ class WorkflowState(TypedDict, total=False):
     owner_id: str
     user_message: str
     normalized_message: str
+    # Full turn transcript for this session, oldest first. Each entry is
+    # plain text plus identifiers only: {"role": "user" | "assistant",
+    # "content": str, "response_id": str (assistant only), "timestamp": str}.
+    # No passwords, cookies, or tokens are ever stored here.
+    messages: list[dict[str, Any]]
     profile: PatientProfile
     intent: Intent
     risk_level: RiskLevel

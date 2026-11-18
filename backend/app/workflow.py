@@ -376,9 +376,17 @@ class MedGuideWorkflow:
         state["normalized_message"] = re.sub(r"\s+", " ", message)
         return state
 
+    # Colloquial variants sit next to their written form.  Keep the user's
+    # own wording (``发烧`` rather than normalising to ``发热``) so the
+    # profile panel shows what was actually said; ingestion already uses
+    # the same vocabulary (see ``ingestion._EMBEDDING_QUERY_TERMS``).
     _PROFILE_SYMPTOMS = (
-        "发热", "咳嗽", "咽痛", "腹痛", "头痛", "胸痛", "皮疹", "头晕", "恶心", "呕吐", "乏力",
-        "流鼻涕", "流涕", "鼻塞", "呼吸困难", "气促",
+        "发热", "发烧", "高烧", "低热", "咳嗽", "咽痛", "喉咙痛", "喉咙疼",
+        "嗓子疼", "嗓子痛", "腹痛", "肚子痛", "肚子疼", "头痛", "头疼",
+        "胸痛", "胸闷", "皮疹", "瘙痒", "头晕", "恶心", "呕吐", "乏力",
+        "疲劳", "累", "流鼻涕", "流涕", "鼻塞", "呼吸困难", "气促", "气短",
+        "腹泻", "便秘", "心悸", "失眠", "睡眠不好", "睡不好", "耳鸣", "耳痛",
+        "水肿", "腰痛", "关节痛", "牙痛", "感冒", "流感",
     )
     _PROFILE_SPLIT = re.compile(r"[，,。；;！？!?]|但是|可是|然而|但")
     _PROFILE_THIRD_PARTY = re.compile(
@@ -401,8 +409,27 @@ class MedGuideWorkflow:
         r"(?P<value>\d{1,4}|[零〇一二两三四五六七八九十百]+|半)\s*"
         r"(?P<unit>分钟|小时|天|周|个月|月|年)"
     )
-    _DURATION_PREFIX = re.compile(r"(?:持续|已经|已有|大约|约|大概|差不多)\s*$")
+    _DURATION_PREFIX = re.compile(r"(?:持续|已经|已有|大约|约|大概|差不多|最近)\s*$")
     _DURATION_NEGATION = re.compile(r"(?:不是|并非|没有|没|否认|不到|不足|不满)\s*$")
+    # Body temperature, mirroring the range already used by ingestion
+    # (35-42.x degrees).  Stored as e.g. ``38.5度``.
+    _TEMPERATURE = re.compile(
+        r"(?<!\d)(?P<value>(?:3[5-9]|4[0-2])(?:\.\d{1,2})?)\s*(?:摄氏度|℃|°C|度)"
+    )
+    # Relative onset (``昨天开始``) only yields a duration when no numeric
+    # duration is known yet, so a later turn never overwrites an earlier,
+    # more precise one (e.g. fever for 3 days, sore throat since yesterday).
+    _RELATIVE_ONSET = {"大前天": "3天", "前天": "2天", "昨天": "1天"}
+    _RELATIVE_ONSET_PATTERN = re.compile(r"(?:从)?(大前天|前天|昨天)(?:开始|起|就|才)?")
+    _CHRONIC_CONDITIONS = (
+        "慢性病", "基础疾病", "基础病", "重大疾病", "高血压", "糖尿病", "心脏病", "哮喘",
+    )
+    # Symptom spellings with filler words in between (``睡眠也不好`` for
+    # ``睡眠不好``).  Tuple lookup is substring-based, so these need a
+    # pattern instead; negation is checked the same way as for plain terms.
+    _PROFILE_SYMPTOM_PATTERNS = {
+        "睡眠不好": re.compile(r"睡(?:眠)?(?:也|都)?不好"),
+    }
     _DURATION_MAXIMUM = {
         "分钟": 10080,
         "小时": 8760,
@@ -501,6 +528,13 @@ class MedGuideWorkflow:
             return f"{numeric}{unit}"
         return None
 
+    @classmethod
+    def _extract_relative_onset(cls, clause: str) -> str | None:
+        match = cls._RELATIVE_ONSET_PATTERN.search(clause)
+        if not match:
+            return None
+        return cls._RELATIVE_ONSET.get(match.group(1))
+
     def extract_profile(self, state: WorkflowState) -> WorkflowState:
         profile: PatientProfile = dict(state.get("profile", {}))
         text = state.get("normalized_message", "")
@@ -536,10 +570,23 @@ class MedGuideWorkflow:
             if age_match:
                 profile["age"] = int(age_match.group(1))
                 break
+        duration_found = False
         for clause in patient_clauses:
             duration = self._extract_duration(clause)
             if duration:
                 profile["duration"] = duration
+                duration_found = True
+                break
+        if not duration_found and not profile.get("duration"):
+            for clause in patient_clauses:
+                onset = self._extract_relative_onset(clause)
+                if onset:
+                    profile["duration"] = onset
+                    break
+        for clause in patient_clauses:
+            temperature_match = self._TEMPERATURE.search(clause)
+            if temperature_match:
+                profile["temperature"] = f"{temperature_match.group('value')}度"
                 break
 
         symptoms = list(profile.get("symptoms", []))
@@ -547,6 +594,14 @@ class MedGuideWorkflow:
             if any(self._asserted_profile_term(clause, symptom) for clause in patient_clauses):
                 if symptom not in symptoms:
                     symptoms.append(symptom)
+        for canonical, pattern in self._PROFILE_SYMPTOM_PATTERNS.items():
+            if canonical in symptoms:
+                continue
+            for clause in patient_clauses:
+                match = pattern.search(clause)
+                if match and not self._PROFILE_NEGATION_BEFORE.search(clause[:match.start()]):
+                    symptoms.append(canonical)
+                    break
         profile["symptoms"] = symptoms
         if symptoms and not profile.get("chief_complaint"):
             profile["chief_complaint"] = symptoms[0]
@@ -554,6 +609,28 @@ class MedGuideWorkflow:
             history_match = re.search(r"(?:既往史|病史|以前有|曾经)[:：]?\s*([^，。；;]+)", clause)
             if history_match:
                 profile["history"] = history_match.group(1).strip()
+                break
+            # ``没有慢性病`` / ``无基础疾病``: the negated condition itself
+            # is the history, even though no ``病史`` noun follows it.
+            # Checked before the generic ``…病史`` rule so ``没有慢性病史``
+            # becomes ``否认慢性病`` instead of the truncated ``否认慢性``.
+            chronic_pattern = "|".join(self._CHRONIC_CONDITIONS)
+            negative_chronic_match = re.search(
+                rf"(?:没有|无|否认)\s*({chronic_pattern})(?:史|等)?",
+                clause,
+            )
+            if negative_chronic_match:
+                profile["history"] = f"否认{negative_chronic_match.group(1)}"
+                break
+            positive_chronic_match = re.search(
+                rf"(?:患有|有)\s*({chronic_pattern})(?:史|等)?",
+                clause,
+            )
+            if positive_chronic_match and not re.search(
+                r"(?:没有|无|否认|不是|并非)",
+                clause[:positive_chronic_match.start()],
+            ):
+                profile["history"] = positive_chronic_match.group(1)
                 break
             negative_history_match = re.search(
                 r"(?:没有|无|否认)\s*([^，。；;]{1,24}?)(?:等)?(?:既往病史|病史)",
@@ -727,6 +804,9 @@ class MedGuideWorkflow:
         duration = str(profile.get("duration", ""))
         if duration and re.fullmatch(r"[\d一二两三四五六七八九十半]+(?:分钟|小时|天|周|个月|月|年)", duration):
             parts.append(f"持续时间：{duration}")
+        temperature = str(profile.get("temperature", ""))
+        if temperature and re.fullmatch(r"(?:3[5-9]|4[0-2])(?:\.\d{1,2})?度", temperature):
+            parts.append(f"体温：{temperature}")
         associated = profile.get("associated_symptoms")
         if isinstance(associated, list):
             safe_associated = [item for item in associated if item in self._PROFILE_SYMPTOMS]
@@ -752,7 +832,7 @@ class MedGuideWorkflow:
             return "患者大致年龄是多少？"
         if not profile.get("duration"):
             return "症状从什么时候开始，持续了多久？"
-        if not profile.get("associated_symptoms") and any(word in text for word in ("发热", "咳嗽", "腹痛", "头痛", "皮疹")):
+        if not profile.get("associated_symptoms") and any(word in text for word in ("发热", "发烧", "咳嗽", "腹痛", "头痛", "头疼", "喉咙痛", "皮疹")):
             return "是否伴随发热、明显疼痛加重、呼吸困难或其他新出现的症状？"
         return None
 
@@ -798,6 +878,46 @@ class MedGuideWorkflow:
                     return True
         return False
 
+    @staticmethod
+    def _append_turn_messages(state: WorkflowState) -> WorkflowState:
+        """Record this turn in the session transcript.
+
+        Runs after ``safety_review``, so the assistant entry holds the final
+        reviewed response. Idempotent replays never reach this node (the
+        caller returns the stored result first), and ``response_id`` guards
+        against a duplicate append if a turn were ever executed twice.
+        """
+        user_message = str(state.get("user_message") or state.get("normalized_message") or "").strip()
+        response = str(state.get("response", "") or "")
+        response_id = str(state.get("response_id") or "")
+        if not user_message and not response:
+            return state
+        messages = [
+            dict(item)
+            for item in state.get("messages", []) or []
+            if isinstance(item, dict)
+        ]
+        if response_id and any(
+            item.get("role") == "assistant" and item.get("response_id") == response_id
+            for item in messages
+        ):
+            return state
+        timestamp = datetime.now(timezone.utc).isoformat()
+        if user_message:
+            messages.append({"role": "user", "content": user_message, "timestamp": timestamp})
+        if response:
+            assistant: dict[str, Any] = {
+                "role": "assistant",
+                "content": response,
+                "timestamp": timestamp,
+            }
+            if response_id:
+                assistant["response_id"] = response_id
+            messages.append(assistant)
+        # Bound transcript growth the same way response_ids are bounded.
+        state["messages"] = messages[-100:]
+        return state
+
     def finalize(self, state: WorkflowState) -> WorkflowState:
         citations = state.get("citations", [])
         structured_result = state.get("structured_result")
@@ -817,11 +937,14 @@ class MedGuideWorkflow:
             summary_parts.append(str(profile["sex"]))
         if profile.get("symptoms"):
             summary_parts.append("主要症状：" + "、".join(profile["symptoms"][:4]))
+        if profile.get("temperature"):
+            summary_parts.append(f"体温{profile['temperature']}")
         if profile.get("duration"):
             summary_parts.append("持续" + str(profile["duration"]))
         if profile.get("history"):
             summary_parts.append("既往史：" + str(profile["history"]))
         state["summary"] = "；".join(summary_parts) if summary_parts else "已建立会话，等待补充症状和基础信息。"
+        self._append_turn_messages(state)
         # The runner writes its actual engine after the node loop completes.
         state.setdefault("workflow_engine", "deterministic")
         return state
