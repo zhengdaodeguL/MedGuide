@@ -33,11 +33,15 @@ class RecordingEmbeddingProvider:
 
 def test_provider_base_urls_are_normalized_and_endpoint_paths_are_stripped() -> None:
     assert _normalize_base_url("https://provider.example/v1/chat/completions") == "https://provider.example/v1"
-    # Gateways have been observed advertising a ``chaat`` completion path in
-    # their setup instructions.  A pasted endpoint is an endpoint either way,
-    # so it normalizes to the same base URL instead of failing closed on a
-    # typo the operator cannot see.
-    assert _normalize_base_url("https://provider.example/v1/chaat/completions") == "https://provider.example/v1"
+    # Issue #8 6b: a mistyped endpoint must fail closed instead of being
+    # silently truncated to a base URL that then hits the wrong endpoint.
+    with pytest.raises(ValueError, match="mistyped completion endpoint"):
+        _normalize_base_url("https://provider.example/v1/chaat/completions")
+    # Query strings and fragments are dropped, never forwarded; only
+    # http(s) schemes are accepted.
+    assert _normalize_base_url("https://provider.example/v1?api_key=secret#frag") == "https://provider.example/v1"
+    with pytest.raises(ValueError, match="HTTP\\(S\\) host"):
+        _normalize_base_url("ftp://provider.example/v1")
     assert _normalize_base_url("https://provider.example/v1/") == "https://provider.example/v1"
 
 
@@ -168,6 +172,10 @@ def test_source_url_rejects_public_but_unapproved_host() -> None:
     "private_key=secret",
     "redirect=https%3A%2F%2Fother.test%2Fx%3Ftoken%3Dsecret",
     "redirect=https%253A%252F%252Fother.test%252Fx%253Fprivate_key%253Dsecret",
+    # Issue #8 6e: a credential smuggled in after a `#` fragment, or a
+    # nested URL carrying userinfo, must be caught as well.
+    "redirect=https://evil/x%23token=secret",
+    "redirect=https://user:secretpass@evil.example/",
     "view=full&token=secret&token=second",
 ])
 def test_source_url_rejects_sensitive_query_parameters(query: str) -> None:

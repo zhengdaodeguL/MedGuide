@@ -112,20 +112,25 @@ class _AtomicRedis:
 
     def _upsert_feedback(self, keys, args):
         feedback_key, metrics_key = keys
-        field, rating, commented, _ttl = args
+        field, rating, commented, _ttl, comment_hash = args
         feedback = self.hashes.setdefault(feedback_key, {})
         metrics = self.hashes.setdefault(metrics_key, {})
         previous = feedback.get(field)
+        stored_comment = feedback.get(f"{field}:commented")
+        comment_recorded = 0
+        if commented == "1" and stored_comment != comment_hash:
+            feedback[f"{field}:commented"] = comment_hash
+            if not stored_comment:
+                metrics["feedback_commented"] = int(metrics.get("feedback_commented", 0)) + 1
+            comment_recorded = 1
         if previous == rating:
-            return 0
+            return comment_recorded
         if previous in {"up", "down"}:
             old_key = f"feedback_{previous}"
             metrics[old_key] = int(metrics.get(old_key, 0)) - 1
         feedback[field] = rating
         rating_key = f"feedback_{rating}"
         metrics[rating_key] = int(metrics.get(rating_key, 0)) + 1
-        if commented == "1" and previous is None:
-            metrics["feedback_commented"] = int(metrics.get("feedback_commented", 0)) + 1
         return 1
 
     def _record_metrics(self, keys, args):
@@ -298,6 +303,23 @@ def test_feedback_upsert_is_atomic_under_concurrent_duplicates_and_changes() -> 
     metrics = redis.hashes[adapter.metrics_key]
     assert metrics["feedback_up"] == 0
     assert metrics["feedback_down"] == 1
+
+
+def test_feedback_comment_counts_once_per_message_in_shared_store() -> None:
+    redis = _AtomicRedis()
+    adapter = RedisSessionAdapter(client=redis)
+
+    # First comment on the message counts, even on a rating change.
+    assert adapter.upsert_feedback("session", "message", "up") is True
+    assert adapter.upsert_feedback("session", "message", "down", "不好") is True
+    # Same rating with a new comment: the comment is recorded (changed),
+    # but the message is still counted once in feedback_commented.
+    assert adapter.upsert_feedback("session", "message", "down", "还是不好") is True
+    assert adapter.upsert_feedback("session", "message", "down") is False
+    metrics = redis.hashes[adapter.metrics_key]
+    assert metrics["feedback_commented"] == 1
+    assert metrics["feedback_down"] == 1
+    assert metrics.get("feedback_up", 0) == 0
 
 
 def test_shared_metrics_record_is_atomic_and_deduplicated_under_concurrency() -> None:
