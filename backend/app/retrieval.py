@@ -5,7 +5,7 @@ import math
 import os
 import re
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from time import monotonic
 from typing import Any
 
@@ -18,7 +18,15 @@ from .infra import _adapter_retry_delay, _adapter_timeout
 
 class IntentRouter:
     KEYWORDS: dict[Intent, tuple[str, ...]] = {
-        "drug": ("药", "用药", "剂量", "副作用", "禁忌", "服用"),
+        "drug": (
+            "药", "用药", "剂量", "副作用", "禁忌", "服用",
+            # How to take a medicine is a drug question even when the drug
+            # name itself is the only drug word in the sentence, e.g.
+            # "布洛芬怎么吃？有什么注意事项？" used to fall through to "faq"
+            # on "注意事项" and then retrieve nothing.
+            "怎么吃", "如何吃", "怎么服用", "如何服用", "吃法", "用法", "用量",
+            "能吃吗", "可以吃吗",
+        ),
         "exam": ("检查", "检验", "化验", "指标", "报告", "价格", "多少钱"),
         "department": (
             "科室", "挂什么号", "挂什么科", "挂哪个科", "看什么科", "去哪个科",
@@ -32,12 +40,24 @@ class IntentRouter:
         "structured": ("库存", "有货", "排班", "号源", "价格", "多少钱", "费用"),
     }
 
+    def __init__(self, drug_names: Iterable[str] | None = None) -> None:
+        # Drug names are supplied by the caller (the workflow passes the
+        # names of the drug documents in the knowledge catalog).  A bare
+        # router still works: the usage patterns in KEYWORDS["drug"] cover
+        # questions such as "布洛芬怎么吃".
+        self.drug_names = tuple(
+            dict.fromkeys(name.strip() for name in (drug_names or ()) if name and name.strip())
+        )
+
     def classify(self, text: str) -> Intent:
         normalized = text.lower()
         structured = sum(1 for word in self.KEYWORDS["structured"] if word in normalized)
         if structured and any(word in normalized for word in ("库存", "有货", "排班", "号源", "价格", "多少钱", "费用")):
             return "structured"
         scores = {intent: sum(1 for word in words if word in normalized) for intent, words in self.KEYWORDS.items() if intent != "structured"}
+        for name in self.drug_names:
+            if name.lower() in normalized:
+                scores["drug"] = scores.get("drug", 0) + 1
         best = max(scores, key=scores.get)
         return best if scores[best] else "unknown"
 
@@ -162,6 +182,39 @@ class HybridRetriever:
     def _load_documents(self) -> list[KnowledgeDocument]:
         catalog = self.knowledge_dir / "catalog.json"
         return load_catalog(catalog)
+
+    @property
+    def drug_names(self) -> tuple[str, ...]:
+        """Drug-related terms from the drug documents in the catalog.
+
+        Tags are curated per document, but some are generic clinical words
+        (e.g. "过敏", "皮疹") that belong to symptoms or other intents, so
+        they are filtered out: only terms that are not part of the shared
+        clinical vocabulary and not a keyword of another intent may vote
+        for the drug intent.
+        """
+        other_keywords = {
+            word
+            for intent, words in IntentRouter.KEYWORDS.items()
+            if intent != "drug"
+            for word in words
+        }
+        clinical_terms = set(MedicalDocumentCleaner._EMBEDDING_QUERY_TERMS)
+        # "止痛" and "退热" are effects, not drug names: as intent signals
+        # they would outvote the disease intent on symptom questions such
+        # as "发烧怎么退热" or "头痛怎么止痛".
+        effect_words = {"止痛", "退热"}
+        names = {
+            tag.strip()
+            for document in self.documents
+            if document.category == "drug"
+            for tag in document.tags
+            if tag and tag.strip()
+            and tag.strip() not in other_keywords
+            and tag.strip() not in clinical_terms
+            and tag.strip() not in effect_words
+        }
+        return tuple(sorted(names))
 
     @staticmethod
     def _cosine(left: list[float], right: list[float]) -> float:
