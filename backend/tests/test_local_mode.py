@@ -51,6 +51,7 @@ def local_environment(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.delenv("MEDGUIDE_KNOWLEDGE_BACKEND", raising=False)
     monkeypatch.delenv("MEDGUIDE_LOCAL_LLM_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("MEDGUIDE_LOCAL_LLM_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("MEDGUIDE_LOCAL_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("MEDGUIDE_API_TRUSTED_PROXY_CIDR", raising=False)
     monkeypatch.delenv("MEDGUIDE_TRUSTED_PROXY_CIDR", raising=False)
     path = tmp_path / "bm25-index.json"
@@ -61,9 +62,17 @@ def local_environment(monkeypatch, tmp_path: Path) -> Path:
     return path
 
 
+@pytest.mark.parametrize("provider,expected_reasoning,forbidden_reasoning", [
+    (None, {"chat_template_kwargs": {"enable_thinking": False}}, "reasoning_effort"),
+    ("llama.cpp", {"chat_template_kwargs": {"enable_thinking": False}}, "reasoning_effort"),
+    ("Ollama ", {"reasoning_effort": "none"}, "chat_template_kwargs"),
+    ("OLLAMA", {"reasoning_effort": "none"}, "chat_template_kwargs"),
+])
 def test_local_sdk_isolates_credentials_proxies_redirects_and_request_settings(
-    local_environment, monkeypatch,
+    local_environment, monkeypatch, provider, expected_reasoning, forbidden_reasoning,
 ) -> None:
+    if provider is not None:
+        monkeypatch.setenv("MEDGUIDE_LOCAL_LLM_PROVIDER", provider)
     for name, value in {
         "OPENAI_API_KEY": "external-synthetic-key", "OPENAI_MODEL": "external-model",
         "OPENAI_CHAT_BASE_URL": "https://external.example/v1", "OPENAI_BASE_URL": "https://other.example/v1",
@@ -109,11 +118,23 @@ def test_local_sdk_isolates_credentials_proxies_redirects_and_request_settings(
             assert request.headers.get("openai-project") != "external-project"
             body = json.loads(request.content)
             assert body["model"] == "medguide-local-qwen3-1.7b"
-            assert body["chat_template_kwargs"] == {"enable_thinking": False}
+            # The probe and generate requests share _local_request_options,
+            # so both must carry the provider's reasoning toggle and none
+            # of the other provider's toggle.
+            for key, value in expected_reasoning.items():
+                assert body[key] == value
+            assert forbidden_reasoning not in body
         assert json.loads(requests[0].content)["max_tokens"] == 16
         assert json.loads(requests[1].content)["max_tokens"] == 512
     finally:
         answerer.close()
+
+
+@pytest.mark.parametrize("value", ["openai", "vllm", "llama", "", "ollama2"])
+def test_local_unknown_provider_fails_closed(local_environment, monkeypatch, value) -> None:
+    monkeypatch.setenv("MEDGUIDE_LOCAL_LLM_PROVIDER", value)
+    with pytest.raises(ValueError, match="MEDGUIDE_LOCAL_LLM_PROVIDER must be llama.cpp or ollama"):
+        OpenAIAnswerer()
 
 
 @pytest.mark.parametrize("missing", ["MEDGUIDE_LOCAL_LLM_MODEL", "MEDGUIDE_LOCAL_LLM_BASE_URL"])
@@ -274,7 +295,9 @@ def test_local_generated_answer_keeps_citations_safety_and_runtime_identity(loca
     assert state["answer_source"] == "local-grounded" and state["citations"]
     assert not state["safety_blocked"]
     public = current.store.public(state)
-    assert public["environment"] == "local" and public["network_enabled"]
+    # Local mode is self-contained (local model, local knowledge, no remote
+    # services): it must not claim network access is enabled.
+    assert public["environment"] == "local" and public["network_enabled"] is False
     assert public["answer_source"] == "local-grounded"
     current.answerer.text = "你已经确诊肺炎，请立即停药。"
     reviewed = current.workflow.run({"session_id": "unsafe", "user_message": "咳嗽三天", "profile": {}})
