@@ -23,6 +23,11 @@ class MetricsStore:
     hallucinations: int = 0
     feedback: Counter[str] = field(default_factory=Counter)
     feedback_by_message: dict[str, Literal["up", "down"]] = field(default_factory=dict)
+    # Latest comment text per feedback key (f"{session_id}:{message_id}").
+    # Only messages that ever carried a non-blank comment get a record; the
+    # "commented" counter counts those records, not submissions.
+    _feedback_comments: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+    _feedback_seq: int = 0
     backend: Any | None = field(default=None, repr=False, compare=False)
     _recorded_responses: set[str] = field(default_factory=set, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -83,10 +88,14 @@ class MetricsStore:
         *,
         session_id: str | None = None,
     ) -> bool:
+        # A blank comment is no comment: it is never stored, never counted
+        # and never makes a resubmission count as a change (issue #21).
+        text = comment.strip() if isinstance(comment, str) else None
+        text = text or None
         shared = getattr(self.backend, "upsert_feedback", None) if self.backend is not None else None
         if callable(shared) and message_id:
             try:
-                result = shared(session_id or "", message_id, rating, comment)
+                result = shared(session_id or "", message_id, rating, text)
                 if result is not None:
                     return bool(result)
             except Exception:
@@ -96,17 +105,92 @@ class MetricsStore:
             feedback_key = f"{session_id}:{message_id}" if session_id and message_id else message_id
             if feedback_key:
                 previous = self.feedback_by_message.get(feedback_key)
-                if previous == rating:
-                    return False
+            rating_changed = previous != rating
+            record = self._feedback_comments.get(feedback_key) if feedback_key else None
+            # Same rating + new comment text is a real change: the stored
+            # text is updated. Same rating + same (or no) comment is not.
+            comment_changed = bool(text) and (record is None or record.get("comment") != text)
+            if not rating_changed and not comment_changed:
+                return False
+            if rating_changed:
                 if previous:
                     self.feedback[previous] -= 1
                     if self.feedback[previous] <= 0:
                         self.feedback.pop(previous, None)
-                self.feedback_by_message[feedback_key] = rating
-            self.feedback[rating] += 1
-            if comment and previous is None:
-                self.feedback["commented"] += 1
+                if feedback_key:
+                    self.feedback_by_message[feedback_key] = rating
+                self.feedback[rating] += 1
+            if comment_changed and feedback_key:
+                if record is None:
+                    # "commented" counts messages that ever carried a comment.
+                    self.feedback["commented"] += 1
+                self._feedback_seq += 1
+                self._feedback_comments[feedback_key] = {
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "rating": rating,
+                    "comment": text,
+                    "seq": self._feedback_seq,
+                }
+            elif record is not None and rating_changed:
+                # Keep the stored comment in step with the current rating.
+                record["rating"] = rating
+                self._feedback_seq += 1
+                record["seq"] = self._feedback_seq
             return True
+
+
+    def remove_feedback(
+        self,
+        message_id: str | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> bool:
+        # Removing a vote only removes the rating itself. "commented" counts
+        # messages that once carried a comment, so a revoke does not decrement
+        # it; comment storage/readback belongs to issue #21, not this one.
+        shared = getattr(self.backend, "remove_feedback", None) if self.backend is not None else None
+        if callable(shared) and message_id:
+            try:
+                result = shared(session_id or "", message_id)
+                if result is not None:
+                    return bool(result)
+            except Exception:
+                pass
+        with self._lock:
+            feedback_key = f"{session_id}:{message_id}" if session_id and message_id else message_id
+            if not feedback_key:
+                return False
+            previous = self.feedback_by_message.get(feedback_key)
+            if not previous:
+                return False
+            self.feedback[previous] -= 1
+            if self.feedback[previous] <= 0:
+                self.feedback.pop(previous, None)
+            del self.feedback_by_message[feedback_key]
+            return True
+
+
+    def feedback_comments(self) -> list[dict[str, Any]]:
+        """Return every stored feedback comment, oldest update first.
+
+        A shared backend owns the records when it is available; local
+        records are the fallback for the same outages `add_feedback`
+        already tolerates.
+        """
+        shared = getattr(self.backend, "list_feedback_comments", None) if self.backend is not None else None
+        if callable(shared):
+            try:
+                result = shared()
+                if isinstance(result, list):
+                    return [dict(item) for item in result if isinstance(item, Mapping)]
+            except Exception:
+                pass
+        with self._lock:
+            return sorted(
+                (dict(record) for record in self._feedback_comments.values()),
+                key=lambda record: int(record.get("seq", 0)),
+            )
 
     def snapshot(self) -> dict:
         shared = getattr(self.backend, "metrics_snapshot", None) if self.backend is not None else None
