@@ -139,21 +139,47 @@ return 0
 
     _UPSERT_FEEDBACK_SCRIPT = """
 local previous = redis.call('HGET', KEYS[1], ARGV[1])
-if previous == ARGV[2] then
-    redis.call('EXPIRE', KEYS[1], ARGV[4])
-    redis.call('EXPIRE', KEYS[2], ARGV[4])
+local stored_comment = redis.call('HGET', KEYS[1], ARGV[1] .. ':comment')
+local comment = ARGV[3]
+local comment_changed = comment ~= '' and stored_comment ~= comment
+if previous == ARGV[2] and not comment_changed then
+    redis.call('EXPIRE', KEYS[1], ARGV[6])
+    redis.call('EXPIRE', KEYS[2], ARGV[6])
     return 0
 end
 if previous == 'up' or previous == 'down' then
-    redis.call('HINCRBY', KEYS[2], 'feedback_' .. previous, -1)
+    if previous ~= ARGV[2] then
+        redis.call('HINCRBY', KEYS[2], 'feedback_' .. previous, -1)
+        redis.call('HINCRBY', KEYS[2], 'feedback_' .. ARGV[2], 1)
+    end
+else
+    redis.call('HINCRBY', KEYS[2], 'feedback_' .. ARGV[2], 1)
 end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
-redis.call('HINCRBY', KEYS[2], 'feedback_' .. ARGV[2], 1)
-if ARGV[3] == '1' and not previous then
-    redis.call('HINCRBY', KEYS[2], 'feedback_commented', 1)
+if comment_changed then
+    redis.call('HSET', KEYS[1], ARGV[1] .. ':comment', comment)
+    redis.call('HSET', KEYS[1], ARGV[1] .. ':session_id', ARGV[4])
+    redis.call('HSET', KEYS[1], ARGV[1] .. ':message_id', ARGV[5])
+    if not stored_comment then
+        redis.call('HINCRBY', KEYS[2], 'feedback_commented', 1)
+    end
 end
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-redis.call('EXPIRE', KEYS[2], ARGV[4])
+local seq = redis.call('HINCRBY', KEYS[2], 'feedback_comment_seq', 1)
+redis.call('HSET', KEYS[1], ARGV[1] .. ':seq', seq)
+redis.call('EXPIRE', KEYS[1], ARGV[6])
+redis.call('EXPIRE', KEYS[2], ARGV[6])
+return 1
+"""
+
+    _REMOVE_FEEDBACK_SCRIPT = """
+local previous = redis.call('HGET', KEYS[1], ARGV[1])
+if previous ~= 'up' and previous ~= 'down' then
+    return 0
+end
+redis.call('HDEL', KEYS[1], ARGV[1])
+redis.call('HINCRBY', KEYS[2], 'feedback_' .. previous, -1)
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+redis.call('EXPIRE', KEYS[2], ARGV[2])
 return 1
 """
 
@@ -542,6 +568,9 @@ return 1
             if not callable(evaluator):
                 return None
             key = hashlib.sha256(f"{session_id}\x00{message_id}".encode("utf-8")).hexdigest()
+            # A blank comment is no comment: send an empty string so the
+            # script leaves any stored text untouched (issue #21).
+            text = comment.strip() if isinstance(comment, str) else ""
             changed = evaluator(
                 self._UPSERT_FEEDBACK_SCRIPT,
                 2,
@@ -549,10 +578,93 @@ return 1
                 self.metrics_key,
                 key,
                 rating,
-                "1" if comment else "0",
+                text,
+                session_id,
+                message_id,
                 self.ttl_seconds,
             )
             return bool(int(changed))
+        except Exception as exc:
+            self._mark_unavailable(exc)
+            return None
+
+    def remove_feedback(
+        self,
+        session_id: str,
+        message_id: str,
+    ) -> bool | None:
+        if not self.ensure_ready() or self.client is None:
+            return None
+        try:
+            evaluator = getattr(self.client, "eval", None)
+            if not callable(evaluator):
+                return None
+            key = hashlib.sha256(f"{session_id}\x00{message_id}".encode("utf-8")).hexdigest()
+            changed = evaluator(
+                self._REMOVE_FEEDBACK_SCRIPT,
+                2,
+                self.metrics_feedback_key,
+                self.metrics_key,
+                key,
+                self.ttl_seconds,
+            )
+            return bool(int(changed))
+        except Exception as exc:
+            self._mark_unavailable(exc)
+            return None
+
+    def list_feedback_comments(self) -> list[dict[str, Any]] | None:
+        """Return stored feedback comments, oldest update first.
+
+        The feedback hash stores one record per message under its opaque
+        key: the rating itself, plus `:comment`, `:session_id`,
+        `:message_id` and `:seq` fields. Records without a comment are
+        not returned.
+        """
+        if not self.ensure_ready() or self.client is None:
+            return None
+        try:
+            hgetall = getattr(self.client, "hgetall", None)
+            if not callable(hgetall):
+                return None
+            raw = hgetall(self.metrics_feedback_key)
+            if not raw:
+                return []
+            values: dict[str, str] = {}
+            for key, value in raw.items():
+                if isinstance(key, bytes):
+                    key = key.decode("utf-8")
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8")
+                values[str(key)] = str(value)
+            records: dict[str, dict[str, Any]] = {}
+            for field, value in values.items():
+                for suffix in (":comment", ":session_id", ":message_id", ":seq"):
+                    if field.endswith(suffix):
+                        records.setdefault(field[: -len(suffix)], {})[suffix[1:]] = value
+                        break
+                else:
+                    records.setdefault(field, {})["rating"] = value
+            comments: list[dict[str, Any]] = []
+            for record in records.values():
+                text = record.get("comment")
+                if not text:
+                    continue
+                try:
+                    seq = int(record.get("seq", 0))
+                except (TypeError, ValueError):
+                    seq = 0
+                comments.append(
+                    {
+                        "session_id": str(record.get("session_id", "")),
+                        "message_id": str(record.get("message_id", "")),
+                        "rating": str(record.get("rating", "")),
+                        "comment": str(text),
+                        "seq": seq,
+                    }
+                )
+            comments.sort(key=lambda item: item["seq"])
+            return comments
         except Exception as exc:
             self._mark_unavailable(exc)
             return None

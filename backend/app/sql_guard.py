@@ -527,7 +527,9 @@ class ReadOnlySQLGuard:
                     cursor = conn.execute(validated, params)
                     rows = tuple(dict(row) for row in cursor.fetchall())
                     columns = tuple(column[0] for column in cursor.description or ())
-            return SQLQueryResult(intent, validated, params, columns, rows)
+            return SQLQueryResult(
+                intent, validated, params, columns, rows, sample_data=self.backend is None
+            )
         except Exception as exc:
             # Adapter/driver exceptions must not escape the API boundary.  Do
             # not return raw driver text because it can contain DSNs, table
@@ -539,6 +541,75 @@ class ReadOnlySQLGuard:
             )
             return SQLQueryResult(intent, validated, params, (), (), blocked=True, reason=reason)
 
+    def _known_names(self, table: str) -> tuple[str, ...] | None:
+        """Distinct entity names registered in a whitelisted table.
+
+        The names come from the table itself (the same data the LIKE
+        predicate searches), never from free text, so a lookup term can
+        only ever be an allowlisted value or one of its prefixes.  Returns
+        ``None`` when the list cannot be loaded (e.g. the data backend is
+        unavailable); callers then fall back to the legacy term extraction
+        instead of pretending the catalog is empty.
+        """
+        if table not in self.TABLE_COLUMNS:
+            return None
+        column = self.TABLE_COLUMNS[table][0]
+        sql = f"SELECT DISTINCT {column} FROM {table}"
+        try:
+            if self.backend is not None:
+                ensure_ready = getattr(self.backend, "ensure_ready", None)
+                if callable(ensure_ready):
+                    if not ensure_ready():
+                        return None
+                elif not getattr(self.backend, "ready", False):
+                    return None
+                _, rows = self.backend.execute(sql, ())
+                names = [str(row.get(column, "")) for row in rows]
+            else:
+                with sqlite3.connect(self.db_path) as conn:
+                    names = [str(row[0]) for row in conn.execute(sql).fetchall()]
+        except Exception:
+            return None
+        return tuple(sorted({name.strip() for name in names if name and name.strip()}))
+
+    @staticmethod
+    def _match_known_term(text: str, known_names: tuple[str, ...]) -> str:
+        """Longest registered entity name (or its longest known prefix) in text.
+
+        A full registered name wins; otherwise the longest prefix of a
+        registered name (at least 2 characters, e.g. "布洛芬" for
+        "布洛芬缓释胶囊") is used, so the LIKE predicate stays an
+        indexable prefix search.  Returns "" when no registered name
+        matches, so the caller can ask for clarification instead of
+        running a lookup that is guaranteed to return zero rows.
+        """
+        best = ""
+        for name in known_names:
+            if name and name in text and len(name) > len(best):
+                best = name
+        if best:
+            return best
+        for name in known_names:
+            for end in range(len(name), 1, -1):
+                prefix = name[:end]
+                if prefix in text:
+                    if len(prefix) > len(best):
+                        best = prefix
+                    break
+        return best
+
+    @staticmethod
+    def _unregistered_term_reason(term: str, kind: str) -> str:
+        """Clarification reason when the user named something unregistered.
+
+        ``term`` is the legacy extraction of what the user wrote; it is
+        only echoed back when it is short and free of LIKE metacharacters,
+        otherwise the generic prompt for a specific name is used.
+        """
+        if term and len(term) <= 24 and not any(ch in term for ch in ("%_", "\\")):
+            return f"未能识别出已登记的{kind}名称“{term}”，请确认名称是否正确，或提供完整的{kind}名称"
+        return f"请提供需要查询的具体{kind}名称"
+
     def from_natural_language(self, text: str) -> SQLQueryResult | None:
         normalized = text.strip()
         if not any(word in normalized for word in ("库存", "有货", "排班", "号源", "价格", "多少钱", "费用")):
@@ -546,7 +617,11 @@ class ReadOnlySQLGuard:
         if self.unavailable_reason:
             return SQLQueryResult("structured", "", (), (), (), blocked=True, reason=self.unavailable_reason)
         if any(word in normalized for word in ("库存", "有货")):
-            drug = self._extract_term(normalized, ("库存", "有货", "药品"))
+            known = self._known_names("drug_inventory")
+            if known is not None:
+                drug = self._match_known_term(normalized, known)
+            else:
+                drug = self._extract_term(normalized, ("库存", "有货", "药品"))
             if not drug:
                 return SQLQueryResult(
                     "drug_inventory",
@@ -555,7 +630,10 @@ class ReadOnlySQLGuard:
                     (),
                     (),
                     blocked=True,
-                    reason="请提供需要查询的具体药品名称",
+                    reason=self._unregistered_term_reason(
+                        self._extract_term(normalized, ("库存", "有货", "药品")),
+                        "药品",
+                    ),
                 )
             sql = "SELECT name, stock, unit, updated_at FROM drug_inventory WHERE name LIKE ? ORDER BY stock DESC LIMIT 50"
             return self.execute("drug_inventory", sql, (f"{drug}%",))
@@ -573,7 +651,11 @@ class ReadOnlySQLGuard:
                 )
             sql = "SELECT doctor_name, department, date, shift, available_slots FROM doctor_schedules WHERE department LIKE ? ORDER BY date, shift LIMIT 50"
             return self.execute("doctor_schedules", sql, (f"{department}%",))
-        exam = self._extract_term(normalized, ("价格", "多少钱", "费用", "检查", "检验"))
+        known = self._known_names("exam_prices")
+        if known is not None:
+            exam = self._match_known_term(normalized, known)
+        else:
+            exam = self._extract_term(normalized, ("价格", "多少钱", "费用", "检查", "检验"))
         if not exam:
             return SQLQueryResult(
                 "exam_prices",
@@ -582,7 +664,10 @@ class ReadOnlySQLGuard:
                 (),
                 (),
                 blocked=True,
-                reason="请提供需要查询的具体检查或检验名称",
+                reason=self._unregistered_term_reason(
+                    self._extract_term(normalized, ("价格", "多少钱", "费用", "检查", "检验")),
+                    "检查或检验",
+                ),
             )
         sql = "SELECT test_name, price, department, notes FROM exam_prices WHERE test_name LIKE ? ORDER BY price LIMIT 50"
         return self.execute("exam_prices", sql, (f"{exam}%",))
@@ -603,7 +688,14 @@ class ReadOnlySQLGuard:
 
     @staticmethod
     def _extract_department(text: str) -> str:
-        for department in ("呼吸内科", "消化内科", "全科医学科", "心内科", "皮肤科"):
+        # Common hospital departments.  The sample schedules only carry a
+        # few of them; an unknown department still returns no rows rather
+        # than a misleading "please specify" block.
+        for department in (
+            "呼吸内科", "消化内科", "全科医学科", "心内科", "皮肤科",
+            "眼科", "耳鼻喉科", "口腔科", "骨科", "神经内科", "神经外科",
+            "儿科", "妇产科", "泌尿外科",
+        ):
             if department in text:
                 return department
         return ""
