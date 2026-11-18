@@ -12,6 +12,7 @@ class PatientProfile(TypedDict, total=False):
     age: int
     sex: str
     duration: str
+    temperature: str
     symptoms: list[str]
     associated_symptoms: list[str]
     history: str
@@ -24,6 +25,11 @@ class WorkflowState(TypedDict, total=False):
     owner_id: str
     user_message: str
     normalized_message: str
+    # Full turn transcript for this session, oldest first. Each entry is
+    # plain text plus identifiers only: {"role": "user" | "assistant",
+    # "content": str, "response_id": str (assistant only), "timestamp": str}.
+    # No passwords, cookies, or tokens are ever stored here.
+    messages: list[dict[str, Any]]
     profile: PatientProfile
     intent: Intent
     risk_level: RiskLevel
@@ -115,13 +121,20 @@ class SQLQueryResult:
     rows: tuple[dict[str, Any], ...]
     blocked: bool = False
     reason: str | None = None
+    # True when the rows come from the built-in seeded sample database
+    # (SQLite test/local backend) rather than a connected production
+    # source, so callers can tell sample data apart from live data.
+    sample_data: bool = False
 
     def as_dict(self) -> dict[str, Any]:
+        # The SQL text itself is an internal detail: it must never cross
+        # the API boundary, where it would expose table/column layout.
+        # Internal callers that need the statement read ``.sql`` directly.
         return {
             "intent": self.intent,
-            "sql": self.sql,
             "columns": list(self.columns),
             "rows": [dict(row) for row in self.rows],
             "blocked": self.blocked,
             "reason": self.reason,
+            "sample_data": self.sample_data,
         }

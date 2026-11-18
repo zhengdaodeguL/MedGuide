@@ -170,6 +170,7 @@ class SessionStore:
             "_version": 0,
             "mode": self.mode,
             "events": [],
+            "messages": [],
             "citations": [],
             "risk_flags": [],
             "risk_assessed": False,
@@ -362,9 +363,97 @@ class SessionStore:
         result = state.get("request_results", {}).get(request_id)
         return merge_request_result(state, result) if isinstance(result, dict) else None
 
+    @property
+    def listing_complete(self) -> bool:
+        """Whether :meth:`list_sessions` can enumerate every session.
+
+        The in-memory store can. A shared Redis backend cannot be enumerated
+        (there is no session index), so listing is incomplete by design and
+        :meth:`list_sessions` returns ``[]`` rather than a partial list.
+        """
+        if self.backend is None:
+            return True
+        return callable(getattr(self.backend, "list_states", None))
+
+    @staticmethod
+    def _session_list_entry(state: WorkflowState) -> dict[str, Any]:
+        messages = state.get("messages", []) or []
+        first_user = next(
+            (
+                str(item.get("content", "")).strip()
+                for item in messages
+                if isinstance(item, dict)
+                and item.get("role") == "user"
+                and str(item.get("content", "")).strip()
+            ),
+            "",
+        )
+        title = first_user[:30] or str(state.get("summary", "") or "") or "新的健康咨询"
+        return {
+            "session_id": state.get("session_id"),
+            "title": title,
+            "summary": state.get("summary", ""),
+            "turn_count": int(state.get("turn_count", 0)),
+            "updated_at": state.get("updated_at"),
+            "risk_level": state.get("risk_level") if state.get("risk_assessed") else None,
+        }
+
+    def list_sessions(self, owner_id: str | None = None) -> list[dict[str, Any]]:
+        """Return one owner's unexpired sessions, newest first.
+
+        Only the in-memory store can enumerate sessions. When a shared
+        backend is selected and it offers no ``list_states`` enumeration,
+        this returns ``[]`` (see :attr:`listing_complete`) instead of a
+        misleading partial list.
+        """
+        owner = str(owner_id or "")
+        if self.backend is not None:
+            listing = getattr(self.backend, "list_states", None)
+            if not callable(listing):
+                return []
+            try:
+                remote_states = listing(owner)
+            except Exception as exc:
+                raise SessionBackendError("共享会话后端暂时不可用，请稍后重试") from exc
+            states = [
+                state
+                for state in (remote_states or [])
+                if isinstance(state, dict) and str(state.get("owner_id", "")) == owner
+            ]
+            states.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            return [self._session_list_entry(state) for state in states]
+        with self._lock:
+            self._purge_expired()
+            states = [
+                deepcopy(state)
+                for state in self._sessions.values()
+                if str(state.get("owner_id", "")) == owner
+            ]
+        states.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        return [self._session_list_entry(state) for state in states]
+
+    @staticmethod
+    def _public_messages(state: WorkflowState) -> list[dict[str, Any]]:
+        """Return only the transcript fields the API may expose."""
+        messages: list[dict[str, Any]] = []
+        for item in state.get("messages", []) or []:
+            if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
+                continue
+            entry: dict[str, Any] = {
+                "role": item["role"],
+                "content": str(item.get("content", "")),
+            }
+            if item.get("response_id"):
+                entry["response_id"] = str(item["response_id"])
+            if item.get("timestamp"):
+                entry["timestamp"] = str(item["timestamp"])
+            messages.append(entry)
+        return messages
+
     def public(self, state: WorkflowState) -> dict:
         return {
             "session_id": state.get("session_id"),
+            "messages": self._public_messages(state),
             "turn_count": state.get("turn_count", 0),
             "profile": state.get("profile", {}),
             "risk_level": state.get("risk_level") if state.get("risk_assessed") else None,
