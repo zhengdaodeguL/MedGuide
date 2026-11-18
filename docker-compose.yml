@@ -48,6 +48,12 @@ services:
       - "8000"
     volumes:
       - medguide_runtime:/app/data/runtime
+    # Top-level restart/mem_limit, not deploy.restart_policy /
+    # deploy.resources: this stack runs under plain `docker compose up`,
+    # where the deploy block is swarm-only and silently ignored. The
+    # 1g limit matches the demo/local composes for this same image.
+    restart: unless-stopped
+    mem_limit: 1g
   medguide-ui:
     build:
       context: .
@@ -64,6 +70,10 @@ services:
     depends_on:
       medguide-api:
         condition: service_healthy
+    # Same restart/mem_limit convention as the demo/local composes for
+    # this nginx image.
+    restart: unless-stopped
+    mem_limit: 128m
   medguide-gateway:
     build:
       context: .
@@ -79,6 +89,10 @@ services:
     depends_on:
       medguide-ui:
         condition: service_healthy
+    # Caddy is a lightweight reverse proxy like the UI nginx above, so it
+    # gets the same 128m limit.
+    restart: unless-stopped
+    mem_limit: 128m
 volumes:
   medguide_runtime:
   medguide_caddy_data:
