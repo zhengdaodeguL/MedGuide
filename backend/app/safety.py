@@ -244,7 +244,7 @@ class SafetyEngine:
                 break
 
         if flags:
-            advice = "建议立即联系当地急救服务或前往最近的急诊；不要仅依赖线上问答等待观察。"
+            advice = "请立即拨打 120（中国大陆急救电话）或前往最近的急诊；不要仅依赖线上问答等待观察。"
             return RiskAssessment("high", tuple(dict.fromkeys(flags)), advice)
 
         watch_flags = [
