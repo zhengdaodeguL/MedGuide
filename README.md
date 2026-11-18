@@ -62,6 +62,7 @@ API 容器会在进程启动前按知识后端准备索引。`bm25` 模式根据
 | --- | --- |
 | `MEDGUIDE_MODE` | 外部模型与共享存储设为 `production`；单实例本地推理使用独立 `local` 配置 |
 | `MEDGUIDE_LOCAL_LLM_BASE_URL` / `MEDGUIDE_LOCAL_LLM_MODEL` | `local` 模式专用的本机模型地址和模型 ID，不继承 `OPENAI_*` |
+| `MEDGUIDE_LOCAL_LLM_PROVIDER` | 本地推理服务类型：`llama.cpp`（默认，发送 `chat_template_kwargs.enable_thinking=false`）或 `ollama`（发送 `reasoning_effort=none`）；非法值启动即报错 |
 | `MEDGUIDE_LOCAL_LLM_TIMEOUT_SECONDS` / `MEDGUIDE_LOCAL_LLM_MAX_TOKENS` | 本地生成预算，默认 120 秒 / 512 token |
 | `MEDGUIDE_DOMAIN` | 已解析到部署主机的公网域名；TLS 网关启动时校验，缺失或非法则失败关闭 |
 | `MEDGUIDE_HTTP_PORT` / `MEDGUIDE_HTTPS_PORT` | TLS 网关对外发布端口，默认 80/443 |

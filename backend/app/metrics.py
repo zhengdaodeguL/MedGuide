@@ -25,6 +25,8 @@ class MetricsStore:
     feedback_by_message: dict[str, Literal["up", "down"]] = field(default_factory=dict)
     backend: Any | None = field(default=None, repr=False, compare=False)
     _recorded_responses: set[str] = field(default_factory=set, repr=False)
+    _commented_keys: set[str] = field(default_factory=set, repr=False)
+    _feedback_comments: dict[str, str] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def record(self, state: WorkflowState) -> None:
@@ -94,18 +96,64 @@ class MetricsStore:
         with self._lock:
             previous: str | None = None
             feedback_key = f"{session_id}:{message_id}" if session_id and message_id else message_id
+            comment_recorded = False
+            if comment:
+                if feedback_key:
+                    # "commented" counts messages that carry a comment, not
+                    # feedback submissions: a later comment on the same
+                    # message is stored, but the message is counted once.
+                    # The latest comment text is kept so a resubmitted
+                    # rating with a new comment is a real change, not a
+                    # silent drop.
+                    if feedback_key not in self._commented_keys:
+                        self._commented_keys.add(feedback_key)
+                        self.feedback["commented"] += 1
+                    if self._feedback_comments.get(feedback_key) != comment:
+                        self._feedback_comments[feedback_key] = comment
+                        comment_recorded = True
+                else:
+                    self.feedback["commented"] += 1
+                    comment_recorded = True
             if feedback_key:
                 previous = self.feedback_by_message.get(feedback_key)
                 if previous == rating:
-                    return False
+                    return comment_recorded
                 if previous:
                     self.feedback[previous] -= 1
                     if self.feedback[previous] <= 0:
                         self.feedback.pop(previous, None)
                 self.feedback_by_message[feedback_key] = rating
             self.feedback[rating] += 1
-            if comment and previous is None:
-                self.feedback["commented"] += 1
+            return True
+
+    def remove_feedback(
+        self,
+        message_id: str | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> bool:
+        # Removing a vote only removes the rating itself. "commented" counts
+        # messages that once carried a comment, so a revoke does not decrement
+        # it; comment storage/readback belongs to issue #21, not this one.
+        shared = getattr(self.backend, "remove_feedback", None) if self.backend is not None else None
+        if callable(shared) and message_id:
+            try:
+                result = shared(session_id or "", message_id)
+                if result is not None:
+                    return bool(result)
+            except Exception:
+                pass
+        with self._lock:
+            feedback_key = f"{session_id}:{message_id}" if session_id and message_id else message_id
+            if not feedback_key:
+                return False
+            previous = self.feedback_by_message.get(feedback_key)
+            if not previous:
+                return False
+            self.feedback[previous] -= 1
+            if self.feedback[previous] <= 0:
+                self.feedback.pop(previous, None)
+            del self.feedback_by_message[feedback_key]
             return True
 
     def snapshot(self) -> dict:

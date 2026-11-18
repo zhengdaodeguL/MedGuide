@@ -24,7 +24,13 @@ def make_workflow(*, answerer: OpenAIAnswerer | None = None) -> MedGuideWorkflow
     return MedGuideWorkflow(HybridRetriever(), ReadOnlySQLGuard(), SafetyEngine(), answerer)
 
 
-def test_high_risk_is_sticky_across_follow_up_turns() -> None:
+def test_high_risk_is_reevaluated_on_follow_up_turns() -> None:
+    # Behaviour change for issue #5: a high-risk turn used to lock the
+    # whole session in emergency mode, so every follow-up -- even an
+    # unrelated question -- returned the same emergency text with no
+    # retrieval. Risk is now re-evaluated from each message; the earlier
+    # high-risk turn is kept in ``risk_history`` and surfaced as a brief
+    # reminder instead of locking the session.
     workflow = make_workflow()
     first = workflow.run(
         {
@@ -37,10 +43,10 @@ def test_high_risk_is_sticky_across_follow_up_turns() -> None:
     second = workflow.run(first)
 
     assert first["risk_level"] == "high"
-    assert second["risk_level"] == "high"
-    assert "胸痛或胸部压榨感" in second["risk_flags"]
-    assert second["citations"] == []
-    assert "急诊" in second["response"]
+    assert second["risk_level"] == "low"
+    assert not second["response"].startswith("当前描述包含需要优先排除的风险信号")
+    assert "再次出现" in second["response"]
+    assert [entry["level"] for entry in second["risk_history"]].count("high") == 1
 
 
 class _FakeCompletions:
