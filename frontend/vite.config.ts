@@ -9,18 +9,24 @@ export default defineConfig(({ mode }) => {
     || env.MEDGUIDE_API_PROXY
     || env.VITE_API_PROXY;
 
+  const proxy = apiProxyTarget ? {
+    "/api": {
+      target: apiProxyTarget,
+      changeOrigin: true,
+    },
+  } : undefined;
+
   return {
     plugins: [react()],
     server: {
       port: 5173,
-      ...(apiProxyTarget ? {
-        proxy: {
-          "/api": {
-            target: apiProxyTarget,
-            changeOrigin: true,
-          },
-        },
-      } : {}),
+      ...(proxy ? { proxy } : {}),
+    },
+    // `vite preview` serves the production build without the dev server,
+    // so it needs the same /api proxy or /api/auth/me answers with HTML.
+    preview: {
+      port: 4173,
+      ...(proxy ? { proxy } : {}),
     },
   };
 });

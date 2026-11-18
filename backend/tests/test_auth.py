@@ -472,14 +472,18 @@ def test_offline_valid_cookie_keeps_cross_user_session_isolation(tmp_path, monke
         client.close()
 
 
-def test_offline_without_cookie_preserves_explicit_local_anonymous_mode(tmp_path, monkeypatch) -> None:
+def test_offline_without_cookie_rejects_anonymous_access(tmp_path, monkeypatch) -> None:
+    # Behavior change (issue #6): offline/test modes no longer have an
+    # anonymous mode. Previously this test pinned anonymous session creation
+    # in offline mode (200 with an empty owner); every protected API now
+    # requires a valid session in all modes, exactly like production.
     current = _runtime(tmp_path, cookie_secure=False, production=False)
     monkeypatch.setattr(main_module, "get_services", lambda: current)
     client = _client()
     try:
         response = client.post("/api/sessions")
-        assert response.status_code == 200
-        assert current.store.get(response.json()["session_id"])["owner_id"] == ""
+        assert response.status_code == 401
+        assert response.json()["detail"] == "请先登录"
     finally:
         client.close()
 
